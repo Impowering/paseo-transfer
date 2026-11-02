@@ -495,6 +495,7 @@ export async function receiveArchive(
     reserved = false,
     target = "";
   try {
+    enforceLimit((await fs.stat(file)).size, limits.maxBytes, "Archive bytes");
     const unpacked = await unpackArchive(file, dir, limits);
     const manifest = unpacked.manifest as Manifest;
     validateManifest(manifest);

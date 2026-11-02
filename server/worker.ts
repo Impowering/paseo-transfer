@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
-import { defaultLimits } from "../shared/limits";
+import { defaultLimits, limitsSchema, enforceLimit } from "../shared/limits";
 import type {
   FileEntry,
   Session,
@@ -724,6 +724,72 @@ export async function receive(
 }
 export async function dispatch(request: WorkerRequest): Promise<unknown> {
   switch (request.action) {
+    case "archive-export": {
+      const { createArchive, archiveSessions } = await import("./archive");
+      const exported = await createArchive(
+        request.home,
+        request.workspaceId,
+        limitsSchema.parse(request.limits ?? {}),
+      );
+      return {
+        file: exported.file,
+        fingerprint: exported.fingerprint,
+        checksum: exported.checksum,
+        wireBytes: exported.wireBytes,
+        bytes: exported.bytes,
+        workspace: exported.manifest.workspace,
+        sourceId: exported.manifest.sourceId,
+        files: exported.manifest.files.length,
+        branch: exported.manifest.branch,
+        sessions: archiveSessions(exported.manifest.sessions),
+        hasIgnored: exported.manifest.hasIgnored,
+      };
+    }
+    case "archive-receive": {
+      const { receiveArchive } = await import("./archive");
+      const { hashFile } = await import("./archive-format");
+      const limits = limitsSchema.parse(request.limits ?? {});
+      enforceLimit(
+        (await fs.stat(request.file)).size,
+        limits.maxBytes,
+        "Archive bytes",
+      );
+      if (
+        !/^[a-f0-9]{64}$/.test(request.checksum) ||
+        (await hashFile(request.file)) !== request.checksum
+      )
+        throw new Error("Transfer upload checksum mismatch.");
+      return receiveArchive(
+        request.home,
+        request.destination,
+        request.file,
+        limits,
+      );
+    }
+    case "archive-source": {
+      const { archiveSource } = await import("./archive");
+      await archiveSource(
+        request.home,
+        request.workspaceId,
+        request.fingerprint,
+        limitsSchema.parse(request.limits ?? {}),
+      );
+      return { archived: true };
+    }
+    case "archive-release": {
+      const dir = path.dirname(request.file);
+      if (
+        path.basename(request.file) !== "archive.bin" ||
+        !path.basename(dir).startsWith("paseo-transfer-export-") ||
+        (await fs.lstat(dir)).isSymbolicLink() ||
+        !inside(await fs.realpath(tmpdir()), await fs.realpath(dir))
+      )
+        throw new Error(
+          "Release requires this worker's private export archive path.",
+        );
+      await fs.rm(dir, { recursive: true, force: true });
+      return { released: true };
+    }
     case "info":
       return {
         version: await version(),

@@ -759,3 +759,92 @@ test("archive receive rejects malformed data without retaining a destination or 
     await fs.rm(exported.dir, { recursive: true, force: true });
   }
 });
+
+test("standalone SSH workers return a large archive handle, verify receive and preserve a changed source", async () => {
+  const fixtureDir = path.join(root, "standalone-ssh");
+  await fs.mkdir(fixtureDir);
+  const fixture = await sshFixture(fixtureDir, { ...process.env });
+  const endpoint = {
+    target: "127.0.0.1",
+    port: fixture.port,
+    identityFile: fixture.key,
+    knownHostsFile: fixture.known,
+    home: sourceHome,
+  };
+  const source = path.join(root, "large-monorepo");
+  const workspace = (await cli(sourceHome, "workspace", "ls")).find(
+    (entry: any) => entry.cwd === source,
+  );
+  let exported: any;
+  try {
+    exported = await invoke<any>(endpoint, {
+      action: "archive-export",
+      workspaceId: workspace.workspaceId,
+    });
+    assert.ok(exported.wireBytes > 256 * 1024 * 1024);
+    assert.ok(
+      JSON.stringify(exported).length < 10_000,
+      "the worker response contains metadata, never the payload",
+    );
+    const upload = path.join(root, "standalone-upload.bin");
+    await fs.copyFile(exported.file, upload);
+    const target = path.join(root, "standalone-copy");
+    const targetEndpoint = { ...endpoint, home: targetHome };
+    await assert.rejects(
+      invoke(targetEndpoint, {
+        action: "archive-receive",
+        file: upload,
+        checksum: "0".repeat(64),
+        destination: target,
+      }),
+      /checksum mismatch/,
+    );
+    await assert.rejects(fs.access(target));
+    const result = await invoke<any>(targetEndpoint, {
+      action: "archive-receive",
+      file: upload,
+      checksum: exported.checksum,
+      destination: target,
+    });
+    assert.equal(result.verified, true);
+    assert.equal(result.sourceArchived, false);
+    assert.equal(
+      await git(target, "rev-parse", "HEAD"),
+      await git(source, "rev-parse", "HEAD"),
+    );
+    assert.equal(
+      await git(target, "status", "--porcelain"),
+      await git(source, "status", "--porcelain"),
+    );
+    await fs.appendFile(path.join(source, "file-0.txt"), "new source edit\n");
+    await assert.rejects(
+      invoke(endpoint, {
+        action: "archive-source",
+        workspaceId: workspace.workspaceId,
+        fingerprint: exported.fingerprint,
+      }),
+      /Source changed/,
+    );
+    assert.ok(
+      (await cli(sourceHome, "workspace", "ls")).some(
+        (entry: any) => entry.workspaceId === workspace.workspaceId,
+      ),
+    );
+    await assert.rejects(
+      invoke(endpoint, {
+        action: "archive-release",
+        file: path.join(root, "outside", "archive.bin"),
+      }),
+      /private export archive/,
+    );
+  } finally {
+    if (exported) {
+      await invoke(endpoint, {
+        action: "archive-release",
+        file: exported.file,
+      });
+      await assert.rejects(fs.access(exported.file));
+    }
+    await fixture.close();
+  }
+});
