@@ -1138,3 +1138,251 @@ test("SSH preview and run use short polled RPCs through the actual authenticated
     "polled preview",
   );
 });
+
+test("native managed workspace archive preserves the common repository and sibling worktree", async () => {
+  const base = path.join(root, "archive-shared-base"),
+    sibling = path.join(root, "archive-shared-sibling");
+  await fs.mkdir(base);
+  await git(base, "init", "-b", "main");
+  await git(base, "config", "user.email", "transfer@example.test");
+  await git(base, "config", "user.name", "Transfer Test");
+  await fs.writeFile(path.join(base, "tracked.txt"), "source\n");
+  await git(base, "add", ".");
+  await git(base, "commit", "-qm", "shared base");
+  const managed = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "worktree",
+    "--path",
+    base,
+    "--new-branch",
+    "archive-own-branch",
+    "--worktree-slug",
+    "shared-archive-proof",
+  );
+  await git(
+    base,
+    "worktree",
+    "add",
+    "-b",
+    "archive-sibling-branch",
+    sibling,
+    "HEAD",
+  );
+  await fs.writeFile(path.join(sibling, "sibling.txt"), "sibling changes\n");
+  await git(sibling, "add", ".");
+  await git(sibling, "commit", "-qm", "sibling must survive");
+  const main = await git(base, "rev-parse", "HEAD"),
+    siblingHead = await git(sibling, "rev-parse", "HEAD"),
+    status = await git(sibling, "status", "--porcelain");
+  await cli(sourceHome, "workspace", "archive", managed.workspaceId);
+  for (
+    let attempt = 0;
+    attempt < 100 &&
+    (await fs.stat(managed.cwd).then(
+      () => true,
+      () => false,
+    ));
+    attempt++
+  )
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  await assert.rejects(fs.access(managed.cwd));
+  assert.ok((await fs.stat(path.join(base, ".git"))).isDirectory());
+  assert.equal(await git(base, "rev-parse", "HEAD"), main);
+  assert.equal(await git(base, "rev-parse", "refs/heads/main"), main);
+  assert.equal(await git(sibling, "rev-parse", "HEAD"), siblingHead);
+  assert.equal(
+    await git(base, "rev-parse", "refs/heads/archive-sibling-branch"),
+    siblingHead,
+  );
+  assert.equal(await git(sibling, "status", "--porcelain"), status);
+  assert.equal(
+    await fs.readFile(path.join(sibling, "sibling.txt"), "utf8"),
+    "sibling changes\n",
+  );
+});
+
+test("sibling worktree commits do not invalidate the source checkout handoff", async () => {
+  const { archiveWriter } = await import("../server/archive-format");
+  const base = path.join(root, "copy-shared-base"),
+    sibling = path.join(root, "copy-shared-sibling");
+  await fs.mkdir(base);
+  await git(base, "init", "-b", "main");
+  await git(base, "config", "user.email", "transfer@example.test");
+  await git(base, "config", "user.name", "Transfer Test");
+  await fs.writeFile(path.join(base, "tracked.txt"), "source\n");
+  await git(base, "add", ".");
+  await git(base, "commit", "-qm", "shared base");
+  const managed = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "worktree",
+    "--path",
+    base,
+    "--new-branch",
+    "copy-own-branch",
+    "--worktree-slug",
+    "shared-copy-proof",
+  );
+  await git(
+    base,
+    "worktree",
+    "add",
+    "-b",
+    "copy-sibling-branch",
+    sibling,
+    "HEAD",
+  );
+  const initialSibling = (await git(sibling, "rev-parse", "HEAD")).trim();
+  let changed = false;
+  const exported = await createArchive(
+    sourceHome,
+    managed.workspaceId,
+    defaultLimits,
+    {
+      writer: async (...args) => {
+        const writer = await archiveWriter(...args);
+        return {
+          ...writer,
+          async add(file) {
+            const ref = await writer.add(file);
+            if (!changed && path.basename(file) === "tracked.txt") {
+              changed = true;
+              await fs.writeFile(
+                path.join(sibling, "sibling.txt"),
+                "new sibling commit\n",
+              );
+              await git(sibling, "add", ".");
+              await git(sibling, "commit", "-qm", "concurrent sibling commit");
+              await git(base, "pack-refs", "--all");
+            }
+            return ref;
+          },
+        };
+      },
+    },
+  );
+  try {
+    assert.equal(changed, true);
+    const fresh = await createArchive(sourceHome, managed.workspaceId);
+    try {
+      assert.equal(fresh.fingerprint, exported.fingerprint);
+    } finally {
+      await fs.rm(fresh.dir, { recursive: true, force: true });
+    }
+    const destination = path.join(root, "shared-copy-target");
+    const result = await receiveArchive(targetHome, destination, exported.file);
+    assert.equal(result.verified, true);
+    assert.equal(
+      (await git(destination, "rev-parse", "copy-sibling-branch")).trim(),
+      initialSibling,
+      "the consistent extra-ref snapshot is retained, not replaced with later sibling commits",
+    );
+    assert.equal(
+      await git(destination, "rev-parse", "HEAD"),
+      await git(managed.cwd, "rev-parse", "HEAD"),
+    );
+    const { archiveSource } = await import("../server/archive");
+    await archiveSource(sourceHome, managed.workspaceId, exported.fingerprint);
+    await assert.rejects(fs.access(managed.cwd));
+    assert.equal(
+      await fs.readFile(path.join(sibling, "sibling.txt"), "utf8"),
+      "new sibling commit\n",
+    );
+    assert.notEqual(
+      (await git(sibling, "rev-parse", "HEAD")).trim(),
+      initialSibling,
+    );
+  } finally {
+    await fs.rm(exported.dir, { recursive: true, force: true });
+  }
+});
+
+test("source branch updates are rejected even when sibling refs are allowed to advance", async () => {
+  const { archiveWriter } = await import("../server/archive-format");
+  const base = path.join(root, "own-ref-base"),
+    sibling = path.join(root, "own-ref-sibling");
+  await fs.mkdir(base);
+  await git(base, "init", "-b", "main");
+  await git(base, "config", "user.email", "transfer@example.test");
+  await git(base, "config", "user.name", "Transfer Test");
+  await fs.writeFile(path.join(base, "tracked.txt"), "source\n");
+  await git(base, "add", ".");
+  await git(base, "commit", "-qm", "own base");
+  const managed = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "worktree",
+    "--path",
+    base,
+    "--new-branch",
+    "must-hold-own-ref",
+    "--worktree-slug",
+    "own-ref-proof",
+  );
+  await git(
+    base,
+    "worktree",
+    "add",
+    "-b",
+    "independent-commit",
+    sibling,
+    "HEAD",
+  );
+  await fs.writeFile(path.join(sibling, "other.txt"), "other commit\n");
+  await git(sibling, "add", ".");
+  await git(sibling, "commit", "-qm", "a different commit");
+  const different = (await git(sibling, "rev-parse", "HEAD")).trim();
+  const original = (await git(managed.cwd, "rev-parse", "HEAD")).trim();
+  for (const restore of [false, true]) {
+    await git(base, "update-ref", "refs/heads/must-hold-own-ref", original);
+    let changed = false;
+    await assert.rejects(
+      createArchive(sourceHome, managed.workspaceId, defaultLimits, {
+        writer: async (...args) => {
+          const writer = await archiveWriter(...args);
+          return {
+            ...writer,
+            async add(file) {
+              const result = await writer.add(file);
+              if (!changed && path.basename(file) === "tracked.txt") {
+                changed = true;
+                await git(
+                  base,
+                  "update-ref",
+                  "refs/heads/must-hold-own-ref",
+                  different,
+                );
+                if (restore)
+                  await git(
+                    base,
+                    "update-ref",
+                    "refs/heads/must-hold-own-ref",
+                    original,
+                  );
+              }
+              return result;
+            },
+          };
+        },
+      }),
+      /Source (Git state|changed)/,
+    );
+    assert.equal(changed, true);
+  }
+  assert.equal(
+    await fs.readFile(path.join(managed.cwd, "tracked.txt"), "utf8"),
+    "source\n",
+  );
+  assert.ok(
+    (await cli(sourceHome, "workspace", "ls")).some(
+      (entry: any) => entry.workspaceId === managed.workspaceId,
+    ),
+  );
+});

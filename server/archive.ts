@@ -69,14 +69,17 @@ async function outputFile(
   cwd: string,
   file: string,
   limits: TransferLimits,
+  input?: string,
 ) {
   const child = spawn(bin, args, {
     cwd,
     env: commandEnvironment(),
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
   });
+  child.stdin?.on("error", () => {});
+  if (input !== undefined) child.stdin!.end(input);
   let stderr = "";
-  child.stderr.on("data", (data) => {
+  child.stderr!.on("data", (data) => {
     if (stderr.length < 65536) stderr += String(data);
   });
   const timer = setTimeout(
@@ -94,7 +97,7 @@ async function outputFile(
     });
     await Promise.all([
       pipeline(
-        child.stdout,
+        child.stdout!,
         createWriteStream(file, { flags: "wx", mode: 0o600 }),
       ),
       done,
@@ -214,8 +217,10 @@ async function gitSourceState(
   if ((await command("git", ["ls-files", "-u"], cwd)).trim())
     throw new Error("Source Git state changed: unresolved index entries.");
   const head = (await command("git", ["rev-parse", "HEAD"], cwd)).trim();
-  let branch: string | null = null;
+  let branch: string | null = null,
+    ref: string | null = null;
   try {
+    ref = (await command("git", ["symbolic-ref", "HEAD"], cwd)).trim();
     branch = (
       await command("git", ["symbolic-ref", "--short", "HEAD"], cwd)
     ).trim();
@@ -272,15 +277,89 @@ async function gitSourceState(
     names,
     ignored,
     patch,
+    ref,
+    refs,
     signature: JSON.stringify({
       head,
       branch,
-      refs,
+      ref,
       names,
       ignored,
       patchHash,
     }),
   };
+}
+
+/** Snapshot ref values privately; sibling commits cannot race the bundle's advertised refs. */
+async function captureBundle(
+  cwd: string,
+  commonDir: string,
+  dir: string,
+  state: Awaited<ReturnType<typeof gitSourceState>>,
+  limits: TransferLimits,
+) {
+  const bare = path.join(dir, "git-snapshot");
+  await command("git", ["init", "--bare", "--template=", bare]);
+  const privateGit = ["-c", "core.hooksPath=/dev/null", "--git-dir", bare];
+  const objects = await fs.realpath(path.join(commonDir, "objects"));
+  await fs.writeFile(
+    path.join(bare, "objects", "info", "alternates"),
+    JSON.stringify(objects) + "\n",
+    { mode: 0o600 },
+  );
+  const refs = new Map<string, string>();
+  for (const line of state.refs.split("\n").filter(Boolean)) {
+    const [ref, sha] = line.split("\0");
+    if (
+      !ref.startsWith("refs/") ||
+      /[\s\0]/.test(ref) ||
+      !/^[a-f0-9]{40,64}$/.test(sha ?? "")
+    )
+      throw new Error("Invalid captured Git ref.");
+    refs.set(ref, sha);
+  }
+  if (state.ref) refs.set(state.ref, state.head);
+  await outputFile(
+    "git",
+    [...privateGit, "update-ref", "--stdin"],
+    cwd,
+    path.join(dir, "refs.log"),
+    limits,
+    [...refs].map(([ref, sha]) => `update ${ref} ${sha}\n`).join(""),
+  );
+  if (state.ref)
+    await command("git", [...privateGit, "symbolic-ref", "HEAD", state.ref]);
+  else
+    await command("git", [
+      ...privateGit,
+      "update-ref",
+      "--no-deref",
+      "HEAD",
+      state.head,
+    ]);
+  const bundle = path.join(dir, "repo.bundle");
+  await outputFile(
+    "git",
+    [...privateGit, "bundle", "create", bundle, "--all", "HEAD"],
+    cwd,
+    path.join(dir, "bundle.log"),
+    limits,
+  );
+  await command(
+    "git",
+    ["bundle", "verify", bundle],
+    cwd,
+    limits.commandTimeoutSeconds * 1000,
+  );
+  await fs.rm(bare, { recursive: true, force: true });
+  return bundle;
+}
+
+/** Only this checkout is handed off; additional refs stay live in the common repository. */
+function sourceFingerprint(manifest: Manifest) {
+  return createHash("sha256")
+    .update(JSON.stringify({ ...manifest, bundle: null }))
+    .digest("hex");
 }
 
 export async function createArchive(
@@ -394,38 +473,56 @@ export async function createArchive(
         cwd,
         (await command("git", ["rev-parse", "--git-common-dir"], cwd)).trim(),
       );
-      fence.watchTree(
-        gitDir,
-        (name) =>
-          [
-            "HEAD",
-            "HEAD.lock",
-            "index",
-            "index.lock",
-            "MERGE_HEAD",
-            "packed-refs",
-            "packed-refs.lock",
-            "refs",
-          ].includes(name) || name.startsWith("refs/"),
+      fence.watchTree(gitDir, (name) =>
+        ["HEAD", "HEAD.lock", "index", "index.lock", "MERGE_HEAD"].includes(
+          name,
+        ),
       );
-      if ((await fs.realpath(commonDir)) !== (await fs.realpath(gitDir)))
-        fence.watchTree(
+      let ownRef: string | null = null;
+      try {
+        ownRef = (await command("git", ["symbolic-ref", "HEAD"], cwd)).trim();
+      } catch {
+        /* detached HEAD */
+      }
+      let ownValue: string | undefined;
+      if (ownRef) {
+        const selectedRef = ownRef;
+        ownValue = await fence.watchValue(
           commonDir,
           (name) =>
-            ["packed-refs", "packed-refs.lock", "refs"].includes(name) ||
-            name.startsWith("refs/"),
+            [
+              selectedRef,
+              selectedRef + ".lock",
+              "packed-refs",
+              "packed-refs.lock",
+            ].includes(name),
+          async () => (await command("git", ["rev-parse", "HEAD"], cwd)).trim(),
         );
+        // Repacking refs preserves the logical value; source branch activity still changes its reflog.
+        const log = `logs/${selectedRef}`;
+        fence.watchTree(
+          commonDir,
+          (name) => name === log || name === log + ".lock",
+        );
+        await fence.track(path.join(commonDir, log));
+      }
       baselineGit = await gitSourceState(cwd, dir, "initial", limits);
+      if (
+        baselineGit.ref !== ownRef ||
+        (ownValue && baselineGit.head !== ownValue)
+      )
+        throw new Error(
+          "Source Git branch changed during transfer preparation.",
+        );
       manifest.hasIgnored = baselineGit.ignored.length > 0;
       manifest.head = baselineGit.head;
       manifest.branch = baselineGit.branch;
       excluded = baselineGit.ignored.map((name) => name.replace(/\/$/, ""));
-      const bundle = path.join(dir, "repo.bundle");
-      await outputFile(
-        "git",
-        ["bundle", "create", bundle, "--all", "HEAD"],
+      const bundle = await captureBundle(
         cwd,
-        path.join(dir, "bundle.log"),
+        commonDir,
+        dir,
+        baselineGit,
         limits,
       );
       manifest.bundle = await writer.add(bundle);
@@ -521,6 +618,7 @@ export async function createArchive(
       file,
       manifest,
       ...result,
+      fingerprint: sourceFingerprint(manifest),
       verifySource,
       closeSourceFence: () => fence.close(),
     };
