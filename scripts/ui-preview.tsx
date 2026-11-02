@@ -21,6 +21,8 @@ const row={workspaceId:'fixture',name:'Continue the release on my laptop',cwd:'/
 async function invoke(method,input){
 if(method==='transfer.hosts')return {hosts:[{target:'laptop',label:'Laptop',source:'ssh'},{target:'desktop',label:'Desktop',source:'tailscale'}]};
 if(method==='transfer.workspaces')return {workspaces:[row,{...row,workspaceId:'fixture2',name:'Fix workspace transfers',cwd:'/home/tom/Projects/paseo-transfer'}]};
+if(method==='transfer.preview.start')return {previewId:'preview',timeoutSeconds:3600};
+if(method==='transfer.preview.status')return {state:'done',message:'Preview ready.',plan:{id:'preview',workspace:row,destination:'/projects/copied-workspace',files:42,sessions:2,bytes:5242880,branch:'release',skipped:[],mode:'copy'}};
 if(method==='transfer.preview')return {id:'preview',workspace:row,destination:input.destination,files:42,sessions:2,bytes:5242880,branch:'release',skipped:[],mode:input.mode};
 if(method==='transfer.run')return {runId:'run'};
 if(method==='transfer.status')return {state:'done',message:'Workspace copied and verified.',result:{workspaceId:'target',cwd:'/home/tom/Projects/paseo-transfer',agents:['claude','codex'],verified:true,sourceArchived:false}};

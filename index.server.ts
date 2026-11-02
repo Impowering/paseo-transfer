@@ -1,6 +1,14 @@
 import { contributeAgentTools } from "./server/native-tools";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { hostsRpc, listRpc, previewRpc, runRpc, statusRpc } from "./shared/rpc";
+import {
+  hostsRpc,
+  listRpc,
+  previewRpc,
+  previewStartRpc,
+  previewStatusRpc,
+  runRpc,
+  statusRpc,
+} from "./shared/rpc";
 import { transferLimits, limitsSchema } from "./shared/limits";
 import { displayPreferences } from "./shared/display";
 import { contributeConnected } from "./server/connected";
@@ -12,6 +20,8 @@ import {
   status,
   dispose,
   configureLimits,
+  startPreview,
+  previewStatus,
 } from "./server/handlers";
 export default function contribute(server: PluginServerContext) {
   const removeTools = contributeAgentTools(server);
@@ -28,6 +38,8 @@ export default function contribute(server: PluginServerContext) {
   server.handle(hostsRpc, hosts);
   server.handle(listRpc, list);
   server.handle(previewRpc, preview);
+  server.handle(previewStartRpc, startPreview);
+  server.handle(previewStatusRpc, previewStatus);
   server.handle(runRpc, start);
   server.handle(statusRpc, status);
   return async () => {

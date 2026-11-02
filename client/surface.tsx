@@ -10,10 +10,12 @@ import {
 import {
   hostsRpc,
   listRpc,
-  previewRpc,
+  previewStartRpc,
+  previewStatusRpc,
   runRpc,
   statusRpc,
 } from "../shared/rpc";
+import { waitForSshPreview } from "./ssh-preview";
 import type { Plan } from "../shared/types";
 import { federation, hostAvailability, rpcForHost } from "./federation";
 import { connectedTransfer, type ConnectedPlan } from "./connected-transfer";
@@ -44,7 +46,8 @@ export function TransferSurface({
   const colors = theme.colors;
   const hosts = useRpc(hostsRpc),
     list = useRpc(listRpc),
-    preview = useRpc(previewRpc),
+    previewStart = useRpc(previewStartRpc),
+    previewStatus = useRpc(previewStatusRpc),
     run = useRpc(runRpc),
     status = useRpc(statusRpc);
   const [remote, setRemote] = useState("");
@@ -123,7 +126,11 @@ export function TransferSurface({
             destination,
             mode,
           })
-        : preview({ source, target, workspaceId, destination, mode }),
+        : waitForSshPreview(
+            { source, target, workspaceId, destination, mode },
+            previewStart,
+            previewStatus,
+          ),
     onSuccess: (data) => {
       setPlan(data);
       setRunId("");

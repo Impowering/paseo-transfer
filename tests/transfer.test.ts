@@ -31,6 +31,13 @@ import { sshHosts, tailscaleHosts } from "../server/discovery";
 import { sshFixture } from "../scripts/ssh-fixture";
 import { preview, start, status, configureLimits } from "../server/handlers";
 import { createArchive, receiveArchive } from "../server/archive";
+import { waitForSshPreview } from "../client/ssh-preview";
+import {
+  previewStartRpc,
+  previewStatusRpc,
+  runRpc,
+  statusRpc,
+} from "../shared/rpc";
 import { defaultLimits } from "../shared/limits";
 const exec = promisify(execFile);
 let root: string, sourceHome: string, targetHome: string, repo: string;
@@ -993,6 +1000,7 @@ test("SSH preview/start handlers transfer over 20,000 files and 256 MiB in all e
     );
     await assert.rejects(fs.access(path.join(root, "ssh-over-limit")));
     configureLimits(async () => defaultLimits);
+    const rpc = getRpc(ids.get(sourceHome)!);
     let index = 0;
     for (const [from, to] of [
       [
@@ -1009,21 +1017,28 @@ test("SSH preview/start handlers transfer over 20,000 files and 256 MiB in all e
       ],
     ]) {
       const target = path.join(root, `ssh-large-handler-${++index}`);
-      const plan = await preview({
-        source: from,
-        target: to,
-        workspaceId: workspace.workspaceId,
-        destination: target,
-        mode: "copy",
-      });
+      const plan = await waitForSshPreview(
+        {
+          source: from,
+          target: to,
+          workspaceId: workspace.workspaceId,
+          destination: target,
+          mode: "copy",
+        },
+        (input) => rpc(previewStartRpc, input),
+        (input) => rpc(previewStatusRpc, input),
+        () => new Promise((resolve) => setTimeout(resolve, 20)),
+      );
       assert.ok(plan.files > 20_000);
       assert.ok(plan.bytes > 256 * 1024 * 1024);
       assert.ok(JSON.stringify(plan).length < 10_000);
-      const { runId } = start({ planId: plan.id });
+      const { runId } = await rpc(runRpc, { planId: plan.id });
       const deadline = Date.now() + 300_000;
-      while (status({ runId }).state === "running" && Date.now() < deadline)
+      let result = await rpc(statusRpc, { runId });
+      while (result.state === "running" && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 20));
-      const result = status({ runId });
+        result = await rpc(statusRpc, { runId });
+      }
       assert.equal(result.state, "done", result.message);
       assert.equal(result.result?.verified, true);
       assert.equal(result.result?.sourceArchived, false);
@@ -1075,4 +1090,51 @@ test("SSH preview/start handlers transfer over 20,000 files and 256 MiB in all e
     configureLimits(async () => defaultLimits);
     await fixture.close();
   }
+});
+
+test("SSH preview and run use short polled RPCs through the actual authenticated daemon client", async () => {
+  const source = path.join(root, "ssh-polled-preview-source");
+  await fs.mkdir(source);
+  await fs.writeFile(path.join(source, "note"), "polled preview");
+  const workspace = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "local",
+    "--path",
+    source,
+  );
+  const rpc = getRpc(ids.get(sourceHome)!);
+  const destination = path.join(root, "ssh-polled-preview-target");
+  const plan = await waitForSshPreview(
+    {
+      source: { target: "", home: sourceHome },
+      target: { target: "", home: targetHome },
+      workspaceId: workspace.workspaceId,
+      destination,
+      mode: "copy",
+    },
+    (input) => rpc(previewStartRpc, input),
+    (input) => rpc(previewStatusRpc, input),
+    () => new Promise((resolve) => setTimeout(resolve, 20)),
+  );
+  assert.equal(plan.workspace.workspaceId, workspace.workspaceId);
+  const { runId } = await rpc(runRpc, { planId: plan.id });
+  let result = await rpc(statusRpc, { runId });
+  for (
+    let attempts = 0;
+    result.state === "running" && attempts < 1000;
+    attempts++
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    result = await rpc(statusRpc, { runId });
+  }
+  assert.equal(result.state, "done", result.message);
+  assert.equal(result.result?.verified, true);
+  assert.equal(result.result?.sourceArchived, false);
+  assert.equal(
+    await fs.readFile(path.join(destination, "note"), "utf8"),
+    "polled preview",
+  );
 });

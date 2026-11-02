@@ -1,6 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type { RpcInput } from "@getpaseo/plugin";
-import { listRpc, previewRpc, runRpc, statusRpc } from "../shared/rpc";
+import {
+  listRpc,
+  previewRpc,
+  previewStartRpc,
+  previewStatusRpc,
+  runRpc,
+  statusRpc,
+} from "../shared/rpc";
 import type { Plan, ExportedArchive, TransferResult } from "../shared/types";
 import { discover } from "./discovery";
 import { invoke, copyArchive, disposeTransport } from "./transport";
@@ -48,16 +55,80 @@ const runs = new Map<
     result: TransferResult | null;
   }
 >();
+const previews = new Map<
+  string,
+  {
+    state: "running" | "done" | "failed";
+    message: string;
+    plan: Plan | null;
+    expires: number;
+  }
+>();
+export async function startPreview(input: RpcInput<typeof previewStartRpc>) {
+  if (disposed) throw new Error("Transfer is shutting down.");
+  for (const [id, task] of previews)
+    if (task.state !== "running" && task.expires < Date.now())
+      previews.delete(id);
+  const limits = limitsSchema.parse(await getLimits());
+  if (disposed) throw new Error("Transfer is shutting down.");
+  if (
+    [...previews.values()].filter((task) => task.state === "running").length >=
+    4
+  )
+    throw new Error("Too many previews are running. Wait for one to finish.");
+  for (const [id, previous] of previews) {
+    if (previews.size < 24) break;
+    if (previous.state !== "running") previews.delete(id);
+  }
+  const previewId = randomUUID();
+  const task = {
+    state: "running" as "running" | "done" | "failed",
+    message: "Preparing transfer preview…",
+    plan: null as Plan | null,
+    expires: 0,
+  };
+  previews.set(previewId, task);
+  void preparePreview(input, limits).then(
+    (plan) => {
+      task.expires = Date.now() + 10 * 60_000;
+      task.plan = plan;
+      task.message = "Preview ready.";
+      task.state = "done";
+    },
+    (error) => {
+      task.expires = Date.now() + 10 * 60_000;
+      task.message = (error as Error).message;
+      task.state = "failed";
+    },
+  );
+  // Export, destination check and cleanup each have the configured worker bound.
+  return { previewId, timeoutSeconds: limits.taskTimeoutSeconds * 3 + 30 };
+}
+export function previewStatus({
+  previewId,
+}: RpcInput<typeof previewStatusRpc>) {
+  const task = previews.get(previewId);
+  if (!task)
+    throw new Error(
+      "Preview status is unavailable after reload or expiry. Preview again.",
+    );
+  return { state: task.state, message: task.message, plan: task.plan };
+}
 let disposed = false;
 let busy = false;
 export async function preview(input: RpcInput<typeof previewRpc>) {
+  return preparePreview(input, limitsSchema.parse(await getLimits()));
+}
+async function preparePreview(
+  input: RpcInput<typeof previewRpc>,
+  limits: TransferLimits,
+) {
   if (
     input.source.target === input.target.target &&
     input.source.home === input.target.home
   )
     throw new Error("Choose different source and target hosts.");
   if (disposed) throw new Error("Transfer is shutting down.");
-  const limits = limitsSchema.parse(await getLimits());
   const snap = await invoke<ExportedArchive>(
     input.source,
     {
@@ -89,6 +160,7 @@ export async function preview(input: RpcInput<typeof previewRpc>) {
     );
     for (const [id, p] of plans) if (p.expires < Date.now()) plans.delete(id);
     if (plans.size >= 4) plans.delete(plans.keys().next().value!);
+    if (disposed) throw new Error("Transfer is shutting down.");
     const plan: Plan = {
       id: randomUUID(),
       workspace: snap.workspace,
@@ -255,5 +327,6 @@ export function status({ runId }: RpcInput<typeof statusRpc>) {
 export function dispose() {
   disposed = true;
   plans.clear();
+  previews.clear();
   disposeTransport();
 }

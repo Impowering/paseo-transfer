@@ -4,7 +4,11 @@ import { createRequire } from "node:module";
 import { build } from "esbuild";
 const require = createRequire(import.meta.url);
 
-async function handlers(checkFails: boolean) {
+async function handlers(
+  checkFails: boolean,
+  releaseFails = true,
+  exported?: Promise<void>,
+) {
   const calls: string[] = [];
   const bundle = await build({
     entryPoints: ["server/handlers.ts"],
@@ -28,7 +32,8 @@ async function handlers(checkFails: boolean) {
   const module = { exports: {} as typeof import("../server/handlers") };
   const invoke = async (_endpoint: unknown, request: { action: string }) => {
     calls.push(request.action);
-    if (request.action === "archive-export")
+    if (request.action === "archive-export") {
+      await exported;
       return {
         file: "/tmp/paseo-transfer-export-ABC123/archive.bin",
         fingerprint: "fingerprint",
@@ -48,12 +53,15 @@ async function handlers(checkFails: boolean) {
         sessions: [],
         hasIgnored: false,
       };
+    }
     if (request.action === "check") {
       if (checkFails) throw new Error("target check disconnected");
       return { destination: "/new-target" };
     }
-    if (request.action === "archive-release")
-      throw new Error("source disconnected during cleanup");
+    if (request.action === "archive-release") {
+      if (releaseFails) throw new Error("source disconnected during cleanup");
+      return { released: true };
+    }
     throw new Error("unexpected operation");
   };
   new Function("require", "module", "exports", bundle.outputFiles[0].text)(
@@ -103,4 +111,27 @@ test("a preview whose cleanup failed cannot leave a startable cached plan", asyn
     () => service.start({ planId: "prepared-plan" }),
     /Preview expired/,
   );
+});
+
+test("SSH preview acknowledges before a long export and publishes its final plan through polling", async () => {
+  let finish!: () => void;
+  const exporting = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const { service, calls } = await handlers(false, false, exporting);
+  const started = await service.startPreview(input);
+  assert.ok(started.timeoutSeconds > 60);
+  assert.equal(service.previewStatus(started).state, "running");
+  assert.deepEqual(calls, ["archive-export"]);
+  finish();
+  for (
+    let attempts = 0;
+    service.previewStatus(started).state === "running" && attempts < 20;
+    attempts++
+  )
+    await new Promise((resolve) => setImmediate(resolve));
+  const result = service.previewStatus(started);
+  assert.equal(result.state, "done");
+  assert.equal(result.plan?.workspace.workspaceId, "w1");
+  assert.deepEqual(calls, ["archive-export", "check", "archive-release"]);
 });
