@@ -5,6 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
+import { resolvePaseoCli } from "./paseo-cli";
 import { defaultLimits, limitsSchema, enforceLimit } from "../shared/limits";
 import type {
   FileEntry,
@@ -64,7 +65,7 @@ export async function cli(
   home: string | undefined,
   ...args: string[]
 ): Promise<any> {
-  const text = await command(process.env.PASEO_SYNC_CLI ?? "paseo", [
+  const text = await command(await resolvePaseoCli(), [
     "--home",
     paseoHome(home),
     "--json",
@@ -259,9 +260,7 @@ export function claudeProjectDir(cwd: string) {
   return `${replaced.slice(0, 200)}-${Math.abs(hash).toString(36)}`;
 }
 async function version() {
-  const value = (
-    await command(process.env.PASEO_SYNC_CLI ?? "paseo", ["--version"])
-  ).trim();
+  const value = (await command(await resolvePaseoCli(), ["--version"])).trim();
   const parts = value.split(".").map(Number);
   if ((parts[0] === 0 && parts[1] < 11) || !Number.isFinite(parts[0]))
     throw new Error(`Paseo 0.11.0 or newer is required (found ${value})`);
