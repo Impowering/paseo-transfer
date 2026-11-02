@@ -1,3 +1,8 @@
+import {
+  gitHistoryDescription,
+  type GitHistoryScope,
+} from "../shared/git-history";
+import { hostIdentity } from "../shared/connected";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import { useMutation, useQuery } from "@tanstack/react-query";
@@ -49,7 +54,8 @@ export function TransferSurface({
     previewStart = useRpc(previewStartRpc),
     previewStatus = useRpc(previewStatusRpc),
     run = useRpc(runRpc),
-    status = useRpc(statusRpc);
+    status = useRpc(statusRpc),
+    identity = useRpc(hostIdentity);
   const [remote, setRemote] = useState("");
   const inventory = useHosts();
   const hostRevision = useSyncExternalStore(
@@ -80,6 +86,8 @@ export function TransferSurface({
   const targetId = direction === "push" ? remoteId : host.id;
   const [workspaceId, setWorkspaceId] = useState(initialWorkspaceId);
   const [destination, setDestination] = useState("");
+  const [gitHistoryScope, setGitHistoryScope] =
+    useState<GitHistoryScope>("repository");
   const [mode, setMode] = useState<"copy" | "move">("copy");
   const [plan, setPlan] = useState<Plan | null>(null);
   const popupKey = workspaceScoped ? `${host.id}:${initialWorkspaceId}` : "";
@@ -125,11 +133,15 @@ export function TransferSurface({
             workspaceId,
             destination,
             mode,
+            gitHistoryScope,
           })
         : waitForSshPreview(
-            { source, target, workspaceId, destination, mode },
+            { source, target, workspaceId, destination, mode, gitHistoryScope },
             previewStart,
             previewStatus,
+            undefined,
+            undefined,
+            () => identity({}),
           ),
     onSuccess: (data) => {
       setPlan(data);
@@ -176,6 +188,7 @@ export function TransferSurface({
     workspaceId,
     destination,
     mode,
+    gitHistoryScope,
   ]);
   useEffect(() => {
     if (plan && "connected" in plan)
@@ -348,6 +361,15 @@ export function TransferSurface({
                   {plan.files} files · {plan.sessions} conversations ·{" "}
                   {(plan.bytes / 1024 / 1024).toFixed(1)} MiB
                   {plan.branch ? ` · ${plan.branch}` : ""}
+                </Text>
+                <Text
+                  style={{
+                    color: colors.foregroundMuted,
+                    fontSize: 14,
+                    lineHeight: 21,
+                  }}
+                >
+                  {gitHistoryDescription(plan.gitHistoryScope)}
                 </Text>
               </View>
               <Text
@@ -795,6 +817,32 @@ export function TransferSurface({
         </Text>
       </View>
       <View style={{ gap: 12 }}>
+        {label("Git history")}
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+          {button(
+            "Full repository",
+            () => setGitHistoryScope("repository"),
+            locked,
+            gitHistoryScope === "repository",
+          )}
+          {button(
+            "This workspace",
+            () => setGitHistoryScope("workspace"),
+            locked,
+            gitHistoryScope === "workspace",
+          )}
+        </View>
+        <Text
+          style={{
+            color: colors.foregroundMuted,
+            fontSize: 14,
+            lineHeight: 21,
+          }}
+        >
+          {gitHistoryDescription(gitHistoryScope)}
+        </Text>
+      </View>
+      <View style={{ gap: 12 }}>
         <View style={{ flexDirection: "row", gap: 8 }}>
           {button("Copy", () => setMode("copy"), locked, mode === "copy")}
           {button("Move", () => setMode("move"), locked, mode === "move")}
@@ -868,6 +916,15 @@ export function TransferSurface({
             {plan.files} files · {plan.sessions} conversations ·{" "}
             {(plan.bytes / 1024 / 1024).toFixed(1)} MiB
             {plan.branch ? ` · ${plan.branch}` : ""}
+          </Text>
+          <Text
+            style={{
+              color: colors.foregroundMuted,
+              fontSize: 14,
+              lineHeight: 21,
+            }}
+          >
+            {gitHistoryDescription(plan.gitHistoryScope)}
           </Text>
           <View style={{ alignSelf: "flex-start" }}>
             {button(

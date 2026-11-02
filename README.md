@@ -39,6 +39,8 @@ Both hosts need Paseo **0.14.0+**, Node **22+**, Git, and Linux/macOS or WSL. Co
 
 **Copy** keeps the source. **Move** archives it after verification; a managed source worktree may be removed. Git-ignored files stay behind, so Move refuses worktrees containing them.
 
+**Full repository** history is the default. Choose **This workspace** explicitly to transfer only the current branch/HEAD and complete ancestor history; other branches and all tags stay on the source. Missing selected objects still block export, and Transfer never fetches or repairs the source. The preview names the selected policy.
+
 Close and reopen the popup to check progress. Keep Paseo open and both hosts connected until the transfer finishes. The sidebar is hidden by default; enable it in **Settings → Plugins → Transfer → Display**. **⌘K / Ctrl+K → Transfer a workspace** opens the full screen, including incoming transfers.
 
 ## Data and recovery

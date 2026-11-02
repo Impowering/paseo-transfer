@@ -1,3 +1,4 @@
+import type { GitHistoryScope } from "./git-history";
 import type { TransferLimits } from "./limits";
 
 export interface Host {
@@ -50,6 +51,7 @@ export interface Snapshot {
   bytes: number;
 }
 export interface ExportedArchive {
+  gitHistoryScope?: GitHistoryScope;
   file: string;
   fingerprint: string;
   checksum: string;
@@ -63,6 +65,7 @@ export interface ExportedArchive {
   hasIgnored: boolean;
 }
 export interface Plan {
+  gitHistoryScope?: GitHistoryScope;
   id: string;
   workspace: Workspace;
   destination: string;
@@ -83,12 +86,14 @@ export interface TransferResult {
 export type WorkerRequest =
   | {
       action: "archive-export";
+      gitHistoryScope?: GitHistoryScope;
       home?: string;
       workspaceId: string;
       limits?: Partial<TransferLimits>;
     }
   | {
       action: "archive-receive";
+      gitHistoryScope?: GitHistoryScope;
       home?: string;
       destination: string;
       file: string;
@@ -97,6 +102,7 @@ export type WorkerRequest =
     }
   | {
       action: "archive-source";
+      gitHistoryScope?: GitHistoryScope;
       home?: string;
       workspaceId: string;
       fingerprint: string;

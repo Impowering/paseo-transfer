@@ -7,6 +7,7 @@ import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { resolvePaseoCli } from "./paseo-cli";
 import { normalizeCliCwd } from "./cli-cwd";
+import { gitHistoryScopes, parseGitHistoryScope } from "../shared/git-history";
 import { defaultLimits, limitsSchema, enforceLimit } from "../shared/limits";
 import type {
   FileEntry,
@@ -52,13 +53,14 @@ export async function command(
   args: string[],
   cwd?: string,
   timeout = 120_000,
+  extraEnv: NodeJS.ProcessEnv = {},
 ) {
   return (
     await exec(bin, args, {
       cwd,
       timeout,
       maxBuffer: MAX_BYTES,
-      env: commandEnvironment(),
+      env: { ...commandEnvironment(), ...extraEnv },
     })
   ).stdout;
 }
@@ -738,8 +740,10 @@ export async function dispatch(request: WorkerRequest): Promise<unknown> {
         request.home,
         request.workspaceId,
         limitsSchema.parse(request.limits ?? {}),
+        { gitHistoryScope: parseGitHistoryScope(request.gitHistoryScope) },
       );
       return {
+        gitHistoryScope: exported.manifest.gitHistoryScope,
         file: exported.file,
         fingerprint: exported.fingerprint,
         checksum: exported.checksum,
@@ -772,6 +776,8 @@ export async function dispatch(request: WorkerRequest): Promise<unknown> {
         request.destination,
         request.file,
         limits,
+        undefined,
+        parseGitHistoryScope(request.gitHistoryScope),
       );
     }
     case "archive-source": {
@@ -781,6 +787,8 @@ export async function dispatch(request: WorkerRequest): Promise<unknown> {
         request.workspaceId,
         request.fingerprint,
         limitsSchema.parse(request.limits ?? {}),
+        undefined,
+        parseGitHistoryScope(request.gitHistoryScope),
       );
       return { archived: true };
     }
@@ -798,6 +806,7 @@ export async function dispatch(request: WorkerRequest): Promise<unknown> {
     case "info":
       return {
         version: await version(),
+        gitHistoryScopes: [...gitHistoryScopes],
         hostname: hostname(),
         home: paseoHome(request.home),
       };

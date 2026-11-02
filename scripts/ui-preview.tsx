@@ -18,19 +18,22 @@ const light=new URLSearchParams(location.search).has('light');
 const theme={colors:{surface0:'#15171b',surface1:'#1e2126',surface2:'#2a2e35',border:'#3b414b',foreground:'#eceef2',foregroundMuted:'#aeb6c2',accent:'#8fb7fa',accentForeground:'#111a29',statusSuccess:'#76d6a1',statusWarning:'#e9c274',statusDanger:'#ff9a9a'}};
 if(light)Object.assign(theme.colors,{surface0:'#ffffff',surface1:'#f4f5f7',surface2:'#e7eaf0',border:'#a3aab5',foreground:'#202630',foregroundMuted:'#515b6b',accent:'#2556a8',accentForeground:'#ffffff',statusDanger:'#a92525'});
 const row={workspaceId:'fixture',name:'Continue the release on my laptop',cwd:'/home/tom/Projects/paseo',isolation:'worktree',project:'Paseo'};
+let previewInput;
 async function invoke(method,input){
+if(method==='transfer.identity')return {serverId:'fixture',protocol:2,taskTimeoutSeconds:3600,gitHistoryScopes:['repository','workspace']};
 if(method==='transfer.hosts')return {hosts:[{target:'laptop',label:'Laptop',source:'ssh'},{target:'desktop',label:'Desktop',source:'tailscale'}]};
 if(method==='transfer.workspaces')return {workspaces:[row,{...row,workspaceId:'fixture2',name:'Fix workspace transfers',cwd:'/home/tom/Projects/paseo-transfer'}]};
-if(method==='transfer.preview.start')return {previewId:'preview',timeoutSeconds:3600};
-if(method==='transfer.preview.status')return {state:'done',message:'Preview ready.',plan:{id:'preview',workspace:row,destination:'/projects/copied-workspace',files:42,sessions:2,bytes:5242880,branch:'release',skipped:[],mode:'copy'}};
-if(method==='transfer.preview')return {id:'preview',workspace:row,destination:input.destination,files:42,sessions:2,bytes:5242880,branch:'release',skipped:[],mode:input.mode};
+if(method==='transfer.preview.start'){previewInput=input;return {previewId:'preview',timeoutSeconds:3600};}
+if(method==='transfer.preview.status')return {state:'done',message:'Preview ready.',plan:{id:'preview',workspace:row,destination:'/projects/copied-workspace',files:42,sessions:2,bytes:5242880,branch:'release',skipped:[],mode:previewInput?.mode??'copy',gitHistoryScope:previewInput?.gitHistoryScope??'repository'}};
+if(method==='transfer.preview')return {id:'preview',workspace:row,destination:input.destination,files:42,sessions:2,bytes:5242880,branch:'release',skipped:[],mode:input.mode,gitHistoryScope:input.gitHistoryScope??'repository'};
 if(method==='transfer.run')return {runId:'run'};
 if(method==='transfer.status')return {state:'done',message:'Workspace copied and verified.',result:{workspaceId:'target',cwd:'/home/tom/Projects/paseo-transfer',agents:['claude','codex'],verified:true,sourceArchived:false}};
 }
 function fixtureRpc(serverId){const tasks=new Map();let seq=0;return async(contract,input)=>{window.fixtureCalls.push({host:serverId,method:contract.name,input});
+if(contract.name==='transfer.identity')return {serverId,protocol:2,taskTimeoutSeconds:3600,gitHistoryScopes:['repository','workspace']};
 if(contract.name==='transfer.workspaces')return invoke(contract.name,input);
 if(contract.name==='transfer.task.start'){const id=String(++seq);tasks.set(id,input.task);return {id};}
-if(contract.name==='transfer.task.status'){const task=tasks.get(input.id);if(task.action==='check')return {state:'done',message:'Checked',destination:task.destination};if(task.action==='receive')return {state:'done',message:'Verified',result:{workspaceId:'received',cwd:'~/Projects/paseo-transfer',agents:[],verified:true,sourceArchived:false}};if(task.action==='archive')return {state:'done',message:'Archived'};return {state:'done',message:'Ready',manifest:{workspace:row,fingerprint:'fixture',sourceId:serverId,files:42,bytes:5242880,branch:'release',hasIgnored:false,sessions:[],wireBytes:10,chunks:1,checksum:'a'.repeat(64)}};}
+if(contract.name==='transfer.task.status'){const task=tasks.get(input.id);if(task.action==='check')return {state:'done',message:'Checked',destination:task.destination};if(task.action==='receive')return {state:'done',message:'Verified',result:{workspaceId:'received',cwd:'~/Projects/paseo-transfer',agents:[],verified:true,sourceArchived:false}};if(task.action==='archive')return {state:'done',message:'Archived'};return {state:'done',message:'Ready',manifest:{gitHistoryScope:task.gitHistoryScope??'repository',workspace:row,fingerprint:'fixture',sourceId:serverId,files:42,bytes:5242880,branch:'release',hasIgnored:false,sessions:[],wireBytes:10,chunks:1,checksum:'a'.repeat(64)}};}
 if(contract.name==='transfer.upload.start')return {id:'upload'};
 if(contract.name==='transfer.chunk.read')return {data:'Zml4dHVyZQ=='};
 if(contract.name==='transfer.chunk.write')return {next:1};

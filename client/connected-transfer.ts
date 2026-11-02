@@ -1,3 +1,8 @@
+import {
+  parseGitHistoryScope,
+  requireGitHistoryScope,
+  type GitHistoryScope,
+} from "../shared/git-history";
 import type { RpcInput } from "@getpaseo/plugin";
 import {
   exportSchema,
@@ -43,6 +48,11 @@ export function createTransferClient(
     const identity = await getRpc(serverId)(hostIdentity, {});
     if (identity.serverId !== serverId)
       throw new Error("The Paseo host changed. Preview again.");
+    if ("gitHistoryScope" in value)
+      requireGitHistoryScope(
+        parseGitHistoryScope(value.gitHistoryScope),
+        identity.gitHistoryScopes,
+      );
     const { id } = await getRpc(serverId)(taskStart, { serverId, task: value });
     try {
       const deadline = now() + identity.taskTimeoutSeconds * 1000;
@@ -74,16 +84,31 @@ export function createTransferClient(
       workspaceId: string;
       destination: string;
       mode: "copy" | "move";
+      gitHistoryScope?: GitHistoryScope;
     }): Promise<ConnectedPlan> {
       if (input.sourceId === input.targetId)
         throw new Error("Choose different source and target hosts.");
+      const gitHistoryScope = parseGitHistoryScope(input.gitHistoryScope);
+      if (gitHistoryScope === "workspace") {
+        for (const serverId of [input.sourceId, input.targetId]) {
+          const identity = await getRpc(serverId)(hostIdentity, {});
+          if (identity.serverId !== serverId)
+            throw new Error("The Paseo host changed. Preview again.");
+          requireGitHistoryScope(gitHistoryScope, identity.gitHistoryScopes);
+        }
+      }
       const exported = await task(input.sourceId, {
         action: "export",
         workspaceId: input.workspaceId,
         mode: input.mode,
+        gitHistoryScope,
       });
       try {
         const manifest = exportSchema.parse(exported.manifest);
+        if (parseGitHistoryScope(manifest.gitHistoryScope) !== gitHistoryScope)
+          throw new Error(
+            "Source did not confirm the selected Git history scope.",
+          );
         if (manifest.sourceId !== input.sourceId)
           throw new Error("Source host changed. Reopen Transfer.");
         const checked = await task(input.targetId, {
@@ -93,6 +118,7 @@ export function createTransferClient(
         });
         await release(input.targetId, checked.id);
         return {
+          gitHistoryScope,
           id: exported.id,
           workspace: manifest.workspace,
           destination: checked.destination!,
@@ -119,6 +145,14 @@ export function createTransferClient(
       return release(plan.connected.sourceId, plan.connected.exportId);
     },
     start(plan: ConnectedPlan) {
+      const gitHistoryScope = parseGitHistoryScope(plan.gitHistoryScope);
+      if (
+        gitHistoryScope !==
+        parseGitHistoryScope(plan.connected.manifest.gitHistoryScope)
+      )
+        throw new Error(
+          "Git history scope changed since preview. Preview again.",
+        );
       if (plan.connected.expires < now())
         throw new Error("Preview expired. Preview this transfer again.");
       if ([...runs.values()].some((run) => run.state === "running"))
@@ -140,14 +174,25 @@ export function createTransferClient(
         let freshId = "",
           uploadId = "";
         try {
+          if (gitHistoryScope === "workspace") {
+            const identity = await getRpc(targetId)(hostIdentity, {});
+            if (identity.serverId !== targetId)
+              throw new Error("The Paseo host changed. Preview again.");
+            requireGitHistoryScope(gitHistoryScope, identity.gitHistoryScopes);
+          }
           const fresh = await task(sourceId, {
             action: "export",
             workspaceId: plan.workspace.workspaceId,
             mode: plan.mode,
+            gitHistoryScope,
           });
           freshId = fresh.id;
           const manifest = exportSchema.parse(fresh.manifest);
-          if (manifest.fingerprint !== plan.connected.manifest.fingerprint)
+          if (
+            parseGitHistoryScope(manifest.gitHistoryScope) !==
+              gitHistoryScope ||
+            manifest.fingerprint !== plan.connected.manifest.fingerprint
+          )
             throw new Error(
               "Source changed since preview. Preview again before transferring.",
             );
@@ -176,6 +221,7 @@ export function createTransferClient(
             action: "receive",
             uploadId,
             destination: plan.destination,
+            gitHistoryScope,
           });
           await release(targetId, received.id);
           const result = received.result;
@@ -190,6 +236,7 @@ export function createTransferClient(
               action: "archive",
               workspaceId: plan.workspace.workspaceId,
               fingerprint: manifest.fingerprint,
+              gitHistoryScope,
             });
             await release(sourceId, archived.id);
             result.sourceArchived = true;
