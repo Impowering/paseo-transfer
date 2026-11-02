@@ -7,7 +7,7 @@
 
 Copy or move a workspace to another host, with Git history, local changes, and Claude/Codex conversations.
 
-This Impower fork adds disk-spooled connected transfers for large repositories. It defaults to 100,000 files and 16 GiB per archive, with configurable host limits and incremental verification. Install the same reviewed commit on both hosts:
+This Impower fork adds disk-spooled connected and SSH transfers for large repositories. It defaults to 100,000 files and 16 GiB per archive, with configurable host limits and incremental verification. Install the same reviewed commit on both hosts:
 
 ```sh
 paseo plugin install git:Impowering/paseo-transfer --ref <immutable-commit>
@@ -50,11 +50,14 @@ See the [transfer details](docs/behavior.md) for supported content, limits, and 
 ## Development
 
 ```sh
-npm ci
-npm run verify
+pnpm install
+pnpm run prepare
+pnpm run typecheck
+pnpm run format:check
+pnpm test
 ```
 
-Reload with `paseo plugin reload transfer`. Provider checks: `npm run test:live`. UI preview: `npx tsx scripts/ui-preview.tsx`.
+Reload with `paseo plugin reload transfer`. Provider checks: `pnpm run test:live` (requires separate provider credentials). UI preview: `pnpm exec tsx scripts/ui-preview.tsx`.
 
 ## License
 

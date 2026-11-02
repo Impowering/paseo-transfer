@@ -1,14 +1,32 @@
 import { randomUUID } from "node:crypto";
 import type { RpcInput } from "@getpaseo/plugin";
 import { listRpc, previewRpc, runRpc, statusRpc } from "../shared/rpc";
-import type {
-  Plan,
-  Snapshot,
-  TransferResult,
-  WorkerRequest,
-} from "../shared/types";
+import type { Plan, ExportedArchive, TransferResult } from "../shared/types";
 import { discover } from "./discovery";
-import { invoke, disposeTransport } from "./transport";
+import { invoke, copyArchive, disposeTransport } from "./transport";
+import {
+  defaultLimits,
+  limitsSchema,
+  type TransferLimits,
+} from "../shared/limits";
+let getLimits: () => Promise<TransferLimits> = async () => defaultLimits;
+export function configureLimits(read: () => Promise<TransferLimits>) {
+  getLimits = read;
+}
+function endpointLabel(endpoint: RpcInput<typeof previewRpc>["source"]) {
+  return JSON.stringify({
+    target: endpoint.target || "local",
+    port: endpoint.port,
+    home: endpoint.home,
+  });
+}
+async function release(
+  endpoint: RpcInput<typeof previewRpc>["source"],
+  file: string,
+  limits: TransferLimits,
+) {
+  await invoke(endpoint, { action: "archive-release", file }, limits);
+}
 
 export const hosts = async () => ({ hosts: await discover() });
 export const list = async (input: RpcInput<typeof listRpc>) =>
@@ -38,47 +56,71 @@ export async function preview(input: RpcInput<typeof previewRpc>) {
     input.source.home === input.target.home
   )
     throw new Error("Choose different source and target hosts.");
-  const snap = await invoke<Snapshot>(input.source, {
-    action: "snapshot",
-    workspaceId: input.workspaceId,
-  });
-  if (
-    input.mode === "move" &&
-    snap.workspace.isolation === "worktree" &&
-    snap.hasIgnored
-  )
-    throw new Error(
-      "This worktree contains Git-ignored files that will not be copied. Choose Copy to keep those files on the source.",
+  if (disposed) throw new Error("Transfer is shutting down.");
+  const limits = limitsSchema.parse(await getLimits());
+  const snap = await invoke<ExportedArchive>(
+    input.source,
+    {
+      action: "archive-export",
+      workspaceId: input.workspaceId,
+      limits,
+    },
+    limits,
+  );
+  let prepared: Plan | undefined, failure: unknown;
+  try {
+    if (
+      input.mode === "move" &&
+      snap.workspace.isolation === "worktree" &&
+      snap.hasIgnored
+    )
+      throw new Error(
+        "This worktree contains Git-ignored files that will not be copied. Choose Copy to keep those files on the source.",
+      );
+    const checked = await invoke<{ destination: string }>(
+      input.target,
+      {
+        action: "check",
+        destination: input.destination,
+        sessions: snap.sessions,
+        limits,
+      },
+      limits,
     );
-  if (snap.skipped.length)
-    throw new Error(
-      `Transfer cannot include every conversation: ${snap.skipped.join("; ")}`,
-    );
-  const checked = await invoke<{ destination: string }>(input.target, {
-    action: "check",
-    destination: input.destination,
-    sessions: snap.sessions,
-  });
-  for (const [id, p] of plans) if (p.expires < Date.now()) plans.delete(id);
-  if (plans.size >= 4) plans.delete(plans.keys().next().value!);
-  const plan: Plan = {
-    id: randomUUID(),
-    workspace: snap.workspace,
-    destination: checked.destination,
-    files: snap.files.length,
-    sessions: snap.sessions.length,
-    bytes: snap.bytes,
-    branch: snap.branch,
-    skipped: snap.skipped,
-    mode: input.mode,
-  };
-  plans.set(plan.id, {
-    plan,
-    input,
-    fingerprint: snap.fingerprint,
-    expires: Date.now() + 10 * 60_000,
-  });
-  return plan;
+    for (const [id, p] of plans) if (p.expires < Date.now()) plans.delete(id);
+    if (plans.size >= 4) plans.delete(plans.keys().next().value!);
+    const plan: Plan = {
+      id: randomUUID(),
+      workspace: snap.workspace,
+      destination: checked.destination,
+      files: snap.files,
+      sessions: snap.sessions.length,
+      bytes: snap.bytes,
+      branch: snap.branch,
+      skipped: [],
+      mode: input.mode,
+    };
+    prepared = plan;
+    plans.set(plan.id, {
+      plan,
+      input,
+      fingerprint: snap.fingerprint,
+      expires: Date.now() + 10 * 60_000,
+    });
+    return plan;
+  } catch (error) {
+    failure = error;
+    throw error;
+  } finally {
+    try {
+      await release(input.source, snap.file, limits);
+    } catch (error) {
+      if (prepared) plans.delete(prepared.id);
+      throw new Error(
+        `${failure ? `${(failure as Error).message} ` : ""}Preview cleanup failed on ${endpointLabel(input.source)}; private spool retained at ${snap.file}: ${(error as Error).message}`,
+      );
+    }
+  }
 }
 export function start({ planId }: RpcInput<typeof runRpc>) {
   if (disposed) throw new Error("Transfer is shutting down.");
@@ -99,22 +141,58 @@ export function start({ planId }: RpcInput<typeof runRpc>) {
   for (const [id, old] of runs)
     if (runs.size > 8 && old.state !== "running") runs.delete(id);
   void (async () => {
+    let limits = defaultLimits;
+    let completed = false,
+      nativeAttempted = false;
+    let fresh: ExportedArchive | undefined, upload: string | undefined;
+    let cleanup = "";
     try {
-      const fresh = await invoke<Snapshot>(cached.input.source, {
-        action: "snapshot",
-        workspaceId: cached.input.workspaceId,
-      });
+      limits = limitsSchema.parse(await getLimits());
+      fresh = await invoke<ExportedArchive>(
+        cached.input.source,
+        {
+          action: "archive-export",
+          workspaceId: cached.input.workspaceId,
+          limits,
+        },
+        limits,
+      );
       if (fresh.fingerprint !== cached.fingerprint)
         throw new Error(
           "Source changed since preview. Preview it again before transferring.",
         );
       if (disposed) throw new Error("Transfer is shutting down.");
       run.message = "Copying and verifying workspace…";
-      const result = await invoke<TransferResult>(cached.input.target, {
-        action: "receive",
-        destination: cached.plan.destination,
-        snapshot: fresh,
-      });
+      ({ file: upload } = await invoke<{ file: string }>(
+        cached.input.target,
+        {
+          action: "archive-upload",
+          wireBytes: fresh.wireBytes,
+          limits,
+        },
+        limits,
+      ));
+      await copyArchive(
+        cached.input.source,
+        cached.input.target,
+        fresh,
+        upload,
+        limits,
+      );
+      if (disposed)
+        throw new Error("Transfer was reloaded; source has been kept open.");
+      nativeAttempted = true;
+      const result = await invoke<TransferResult>(
+        cached.input.target,
+        {
+          action: "archive-receive",
+          destination: cached.plan.destination,
+          file: upload,
+          checksum: fresh.checksum,
+          limits,
+        },
+        limits,
+      );
       if (!result.verified)
         throw new Error(
           "Target did not verify the transfer; source has been kept open.",
@@ -126,23 +204,42 @@ export function start({ planId }: RpcInput<typeof runRpc>) {
             "Transfer was reloaded; target is copied but source was kept open.",
           );
         run.message = "Destination verified. Archiving source…";
-        await invoke(cached.input.source, {
-          action: "archive",
-          workspaceId: cached.input.workspaceId,
-          fingerprint: fresh.fingerprint,
-        } satisfies WorkerRequest);
+        await invoke(
+          cached.input.source,
+          {
+            action: "archive-source",
+            workspaceId: cached.input.workspaceId,
+            fingerprint: fresh.fingerprint,
+            limits,
+          },
+          limits,
+        );
         result.sourceArchived = true;
       }
-      run.state = "done";
+      completed = true;
       run.message =
         cached.plan.mode === "move"
           ? "Workspace moved and verified."
           : "Workspace copied and verified.";
     } catch (error) {
-      run.state = "failed";
       run.message = (error as Error).message;
+      if (nativeAttempted)
+        run.message += ` Check destination ${cached.plan.destination} and the original source before retrying; a native operation may have committed before its reply was lost.`;
     } finally {
+      for (const [endpoint, file] of [
+        [cached.input.source, fresh?.file],
+        [cached.input.target, upload],
+      ] as const) {
+        if (!file) continue;
+        try {
+          await release(endpoint, file, limits);
+        } catch (error) {
+          cleanup += ` Private spool retained on ${endpointLabel(endpoint)} at ${file}: ${(error as Error).message}`;
+        }
+      }
+      if (cleanup) run.message += cleanup;
       busy = false;
+      run.state = completed ? "done" : "failed";
     }
   })();
   return { runId };

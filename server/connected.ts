@@ -25,8 +25,6 @@ import { hashFile } from "./archive-format";
 import {
   defaultLimits,
   enforceLimit,
-  limitsSchema,
-  transferLimits,
   type TransferLimits,
 } from "../shared/limits";
 
@@ -306,14 +304,11 @@ export function createConnectedService(
   };
 }
 
-export function contributeConnected(server: PluginServerContext) {
-  const settings = server.registerSettings(transferLimits);
-  const service = createConnectedService(undefined, async () => {
-    const state = await settings.read();
-    if (state.status !== "ready")
-      throw new Error("Transfer limits settings are invalid.");
-    return limitsSchema.parse(state.values);
-  });
+export function contributeConnected(
+  server: PluginServerContext,
+  getLimits: () => Promise<TransferLimits>,
+) {
+  const service = createConnectedService(undefined, getLimits);
   server.handle(hostIdentity, service.identity);
   server.handle(taskStart, service.start);
   server.handle(taskStatus, service.status);

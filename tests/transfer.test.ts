@@ -29,7 +29,7 @@ import {
 import { invoke, sshArgs, shellQuote } from "../server/transport";
 import { sshHosts, tailscaleHosts } from "../server/discovery";
 import { sshFixture } from "../scripts/ssh-fixture";
-import { preview, start, status } from "../server/handlers";
+import { preview, start, status, configureLimits } from "../server/handlers";
 import { createArchive, receiveArchive } from "../server/archive";
 import { defaultLimits } from "../shared/limits";
 const exec = promisify(execFile);
@@ -962,5 +962,117 @@ test("ambiguous native creation preserves a registered or unverifiable destinati
     }
   } finally {
     await fs.rm(exported.dir, { recursive: true, force: true });
+  }
+});
+
+test("SSH preview/start handlers transfer over 20,000 files and 256 MiB in all endpoint directions", async () => {
+  const fixtureDir = path.join(root, "handler-ssh");
+  await fs.mkdir(fixtureDir);
+  const fixture = await sshFixture(fixtureDir, { ...process.env });
+  const remote = {
+    target: "127.0.0.1",
+    port: fixture.port,
+    identityFile: fixture.key,
+    knownHostsFile: fixture.known,
+  };
+  const source = path.join(root, "large-monorepo");
+  const workspace = (await cli(sourceHome, "workspace", "ls")).find(
+    (entry: any) => entry.cwd === source,
+  );
+  try {
+    configureLimits(async () => ({ ...defaultLimits, maxFiles: 100 }));
+    await assert.rejects(
+      preview({
+        source: { target: "", home: sourceHome },
+        target: { ...remote, home: targetHome },
+        workspaceId: workspace.workspaceId,
+        destination: path.join(root, "ssh-over-limit"),
+        mode: "copy",
+      }),
+      /limit/,
+    );
+    await assert.rejects(fs.access(path.join(root, "ssh-over-limit")));
+    configureLimits(async () => defaultLimits);
+    let index = 0;
+    for (const [from, to] of [
+      [
+        { target: "", home: sourceHome },
+        { ...remote, home: targetHome },
+      ],
+      [
+        { ...remote, home: sourceHome },
+        { target: "", home: targetHome },
+      ],
+      [
+        { ...remote, home: sourceHome },
+        { ...remote, home: targetHome },
+      ],
+    ]) {
+      const target = path.join(root, `ssh-large-handler-${++index}`);
+      const plan = await preview({
+        source: from,
+        target: to,
+        workspaceId: workspace.workspaceId,
+        destination: target,
+        mode: "copy",
+      });
+      assert.ok(plan.files > 20_000);
+      assert.ok(plan.bytes > 256 * 1024 * 1024);
+      assert.ok(JSON.stringify(plan).length < 10_000);
+      const { runId } = start({ planId: plan.id });
+      const deadline = Date.now() + 300_000;
+      while (status({ runId }).state === "running" && Date.now() < deadline)
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      const result = status({ runId });
+      assert.equal(result.state, "done", result.message);
+      assert.equal(result.result?.verified, true);
+      assert.equal(result.result?.sourceArchived, false);
+      assert.equal(
+        await git(target, "rev-parse", "HEAD"),
+        await git(source, "rev-parse", "HEAD"),
+      );
+      assert.equal(
+        await git(target, "rev-parse", "unpublished"),
+        await git(source, "rev-parse", "unpublished"),
+      );
+      assert.equal(
+        await git(
+          target,
+          "diff",
+          "--cached",
+          "--binary",
+          "--full-index",
+          "HEAD",
+        ),
+        await git(
+          source,
+          "diff",
+          "--cached",
+          "--binary",
+          "--full-index",
+          "HEAD",
+        ),
+      );
+      assert.equal(
+        await git(target, "status", "--porcelain"),
+        await git(source, "status", "--porcelain"),
+      );
+      assert.deepEqual(
+        await fs.readFile(path.join(target, "file-20004.txt")),
+        await fs.readFile(path.join(source, "file-20004.txt")),
+      );
+      assert.equal(
+        (await fs.stat(path.join(target, "large.bin"))).size,
+        129 * 1024 * 1024,
+      );
+      assert.ok(
+        (await cli(sourceHome, "workspace", "ls")).some(
+          (entry: any) => entry.workspaceId === workspace.workspaceId,
+        ),
+      );
+    }
+  } finally {
+    configureLimits(async () => defaultLimits);
+    await fixture.close();
   }
 });

@@ -1,3 +1,4 @@
+export { streamArchive } from "./archive-stream";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
@@ -776,19 +777,16 @@ export async function dispatch(request: WorkerRequest): Promise<unknown> {
       );
       return { archived: true };
     }
+    case "archive-upload": {
+      const { allocateUpload } = await import("./archive-stream");
+      return allocateUpload(
+        request.wireBytes,
+        limitsSchema.parse(request.limits ?? {}),
+      );
+    }
     case "archive-release": {
-      const dir = path.dirname(request.file);
-      if (
-        path.basename(request.file) !== "archive.bin" ||
-        !path.basename(dir).startsWith("paseo-transfer-export-") ||
-        (await fs.lstat(dir)).isSymbolicLink() ||
-        !inside(await fs.realpath(tmpdir()), await fs.realpath(dir))
-      )
-        throw new Error(
-          "Release requires this worker's private export archive path.",
-        );
-      await fs.rm(dir, { recursive: true, force: true });
-      return { released: true };
+      const { releaseArchive } = await import("./archive-stream");
+      return releaseArchive(request.file);
     }
     case "info":
       return {
@@ -801,7 +799,12 @@ export async function dispatch(request: WorkerRequest): Promise<unknown> {
     case "snapshot":
       return snapshot(request.home, request.workspaceId);
     case "check":
-      return check(request.home, request.destination, request.sessions);
+      return check(
+        request.home,
+        request.destination,
+        request.sessions,
+        limitsSchema.parse(request.limits ?? {}).maxFiles,
+      );
     case "receive":
       return receive(request.home, request.destination, request.snapshot);
     case "archive": {
