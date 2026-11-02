@@ -35,6 +35,10 @@ import {
 } from "./archive-format";
 import { SourceFence } from "./source-fence";
 import { normalizeCliCwd } from "./cli-cwd";
+import {
+  parseGitHistoryScope,
+  type GitHistoryScope,
+} from "../shared/git-history";
 
 interface ArchiveFile {
   path: string;
@@ -47,6 +51,7 @@ interface ArchiveSession extends Omit<Session, "files"> {
 }
 interface Manifest {
   version: 2;
+  gitHistoryScope?: GitHistoryScope;
   sourceId: string;
   workspace: Workspace;
   head: string | null;
@@ -74,7 +79,11 @@ async function outputFile(
 ) {
   const child = spawn(bin, args, {
     cwd,
-    env: commandEnvironment(),
+    env: {
+      ...commandEnvironment(),
+      GIT_NO_LAZY_FETCH: "1",
+      GIT_ALLOW_PROTOCOL: "",
+    },
     stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
   });
   child.stdin?.on("error", () => {});
@@ -213,35 +222,40 @@ async function sessionSources(
   return result;
 }
 
+const noFetchEnv = { GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "" };
+async function sourceGit(args: string[], cwd?: string, timeout = 120_000) {
+  return command("git", args, cwd, timeout, noFetchEnv);
+}
+
 async function gitSourceState(
   cwd: string,
   dir: string,
   name: string,
   limits: TransferLimits,
+  gitHistoryScope: GitHistoryScope,
 ) {
-  if ((await command("git", ["ls-files", "-u"], cwd)).trim())
+  if ((await sourceGit(["ls-files", "-u"], cwd)).trim())
     throw new Error("Source Git state changed: unresolved index entries.");
-  const head = (await command("git", ["rev-parse", "HEAD"], cwd)).trim();
+  const head = (await sourceGit(["rev-parse", "HEAD"], cwd)).trim();
   let branch: string | null = null,
     ref: string | null = null;
   try {
-    ref = (await command("git", ["symbolic-ref", "HEAD"], cwd)).trim();
-    branch = (
-      await command("git", ["symbolic-ref", "--short", "HEAD"], cwd)
-    ).trim();
+    ref = (await sourceGit(["symbolic-ref", "HEAD"], cwd)).trim();
+    branch = (await sourceGit(["symbolic-ref", "--short", "HEAD"], cwd)).trim();
   } catch {
     /* detached HEAD */
   }
-  const refs = await command(
-    "git",
-    ["for-each-ref", "--format=%(refname)%00%(objectname)"],
-    cwd,
-  );
+  const refs =
+    gitHistoryScope === "repository"
+      ? await sourceGit(
+          ["for-each-ref", "--format=%(refname)%00%(objectname)"],
+          cwd,
+        )
+      : "";
   const names = [
     ...new Set(
       (
-        await command(
-          "git",
+        await sourceGit(
           ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
           cwd,
         )
@@ -251,8 +265,7 @@ async function gitSourceState(
     ),
   ].sort();
   const ignored = (
-    await command(
-      "git",
+    await sourceGit(
       [
         "ls-files",
         "--others",
@@ -302,9 +315,25 @@ async function captureBundle(
   dir: string,
   state: Awaited<ReturnType<typeof gitSourceState>>,
   limits: TransferLimits,
+  gitHistoryScope: GitHistoryScope,
 ) {
+  if (
+    gitHistoryScope === "workspace" &&
+    state.ref &&
+    !state.ref.startsWith("refs/heads/")
+  )
+    throw new Error(
+      "Workspace Git history requires a local branch or detached HEAD.",
+    );
+  if (
+    (await sourceGit(["rev-parse", "--is-shallow-repository"], cwd)).trim() ===
+    "true"
+  )
+    throw new Error(
+      "Complete Git history is required; shallow repositories are unsupported.",
+    );
   const bare = path.join(dir, "git-snapshot");
-  await command("git", ["init", "--bare", "--template=", bare]);
+  await sourceGit(["init", "--bare", "--template=", bare]);
   const privateGit = ["-c", "core.hooksPath=/dev/null", "--git-dir", bare];
   const objects = await fs.realpath(path.join(commonDir, "objects"));
   await fs.writeFile(
@@ -333,9 +362,9 @@ async function captureBundle(
     [...refs].map(([ref, sha]) => `update ${ref} ${sha}\n`).join(""),
   );
   if (state.ref)
-    await command("git", [...privateGit, "symbolic-ref", "HEAD", state.ref]);
+    await sourceGit([...privateGit, "symbolic-ref", "HEAD", state.ref]);
   else
-    await command("git", [
+    await sourceGit([
       ...privateGit,
       "update-ref",
       "--no-deref",
@@ -350,8 +379,7 @@ async function captureBundle(
     path.join(dir, "bundle.log"),
     limits,
   );
-  await command(
-    "git",
+  await sourceGit(
     ["bundle", "verify", bundle],
     cwd,
     limits.commandTimeoutSeconds * 1000,
@@ -371,8 +399,13 @@ export async function createArchive(
   home: string | undefined,
   workspaceId: string,
   limits = defaultLimits,
-  options: { keepFence?: boolean; writer?: typeof archiveWriter } = {},
+  options: {
+    keepFence?: boolean;
+    writer?: typeof archiveWriter;
+    gitHistoryScope?: GitHistoryScope;
+  } = {},
 ) {
+  const gitHistoryScope = parseGitHistoryScope(options.gitHistoryScope);
   const workspace = (await list(home)).find(
     (entry) => entry.workspaceId === workspaceId,
   );
@@ -437,6 +470,7 @@ export async function createArchive(
     await fence.watchFile(path.join(paseoHome(home), "server-id"));
     const manifest: Manifest = {
       version: 2,
+      gitHistoryScope,
       sourceId: (
         await fs.readFile(path.join(paseoHome(home), "server-id"), "utf8")
       ).trim(),
@@ -452,9 +486,7 @@ export async function createArchive(
     };
     let gitRoot: string | null = null;
     try {
-      gitRoot = (
-        await command("git", ["rev-parse", "--show-toplevel"], cwd)
-      ).trim();
+      gitRoot = (await sourceGit(["rev-parse", "--show-toplevel"], cwd)).trim();
     } catch {
       /* directory workspace */
     }
@@ -467,16 +499,16 @@ export async function createArchive(
         );
       if (await exists(path.join(cwd, ".gitmodules")))
         throw new Error("Submodule workspaces are not supported yet.");
-      if ((await command("git", ["ls-files", "-u"], cwd)).trim())
+      if ((await sourceGit(["ls-files", "-u"], cwd)).trim())
         throw new Error(
           "Resolve Git conflicts before transferring this workspace.",
         );
       const gitDir = (
-        await command("git", ["rev-parse", "--absolute-git-dir"], cwd)
+        await sourceGit(["rev-parse", "--absolute-git-dir"], cwd)
       ).trim();
       const commonDir = path.resolve(
         cwd,
-        (await command("git", ["rev-parse", "--git-common-dir"], cwd)).trim(),
+        (await sourceGit(["rev-parse", "--git-common-dir"], cwd)).trim(),
       );
       fence.watchTree(gitDir, (name) =>
         ["HEAD", "HEAD.lock", "index", "index.lock", "MERGE_HEAD"].includes(
@@ -485,7 +517,7 @@ export async function createArchive(
       );
       let ownRef: string | null = null;
       try {
-        ownRef = (await command("git", ["symbolic-ref", "HEAD"], cwd)).trim();
+        ownRef = (await sourceGit(["symbolic-ref", "HEAD"], cwd)).trim();
       } catch {
         /* detached HEAD */
       }
@@ -501,7 +533,7 @@ export async function createArchive(
               "packed-refs",
               "packed-refs.lock",
             ].includes(name),
-          async () => (await command("git", ["rev-parse", "HEAD"], cwd)).trim(),
+          async () => (await sourceGit(["rev-parse", "HEAD"], cwd)).trim(),
         );
         // Repacking refs preserves the logical value; source branch activity still changes its reflog.
         const log = `logs/${selectedRef}`;
@@ -511,7 +543,13 @@ export async function createArchive(
         );
         await fence.track(path.join(commonDir, log));
       }
-      baselineGit = await gitSourceState(cwd, dir, "initial", limits);
+      baselineGit = await gitSourceState(
+        cwd,
+        dir,
+        "initial",
+        limits,
+        gitHistoryScope,
+      );
       if (
         baselineGit.ref !== ownRef ||
         (ownValue && baselineGit.head !== ownValue)
@@ -529,6 +567,7 @@ export async function createArchive(
         dir,
         baselineGit,
         limits,
+        gitHistoryScope,
       );
       manifest.bundle = await writer.add(bundle);
       await fs.rm(bundle);
@@ -576,6 +615,7 @@ export async function createArchive(
           dir,
           `verify-${++verification}`,
           limits,
+          gitHistoryScope,
         );
         try {
           if (state.signature !== baselineGit.signature) {
@@ -644,6 +684,7 @@ function summarySessions(sessions: ArchiveSession[]): Session[] {
 export const archiveSessions = summarySessions;
 
 function validateManifest(manifest: Manifest) {
+  parseGitHistoryScope(manifest?.gitHistoryScope);
   if (
     !manifest ||
     manifest.version !== 2 ||
@@ -758,6 +799,7 @@ export async function receiveArchive(
   file: string,
   limits = defaultLimits,
   native = { cli, list },
+  expectedGitHistoryScope?: GitHistoryScope,
 ): Promise<TransferResult> {
   const dir = await privateDirectory("paseo-transfer-receive-");
   const nativeCreated: string[] = [];
@@ -771,6 +813,14 @@ export async function receiveArchive(
     const unpacked = await unpackArchive(file, dir, limits);
     const manifest = unpacked.manifest as Manifest;
     validateManifest(manifest);
+    const gitHistoryScope = parseGitHistoryScope(manifest.gitHistoryScope);
+    if (
+      expectedGitHistoryScope !== undefined &&
+      gitHistoryScope !== parseGitHistoryScope(expectedGitHistoryScope)
+    )
+      throw new Error(
+        "Git history scope differs from the verified transfer plan.",
+      );
     enforceLimit(
       manifest.files.length +
         manifest.deleted.length +
@@ -797,6 +847,25 @@ export async function receiveArchive(
     }
     const bundle = manifest.bundle ? blob(manifest.bundle) : null;
     const patch = manifest.indexPatch ? blob(manifest.indexPatch) : null;
+    if (bundle && gitHistoryScope === "workspace") {
+      const refs = (await sourceGit(["bundle", "list-heads", bundle]))
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+      const expected = new Map([["HEAD", manifest.head!]]);
+      if (manifest.branch)
+        expected.set(`refs/heads/${manifest.branch}`, manifest.head!);
+      for (const line of refs) {
+        const [sha, ref] = line.split(" ");
+        if (expected.get(ref) !== sha)
+          throw new Error("Workspace bundle contains unexpected Git refs.");
+        expected.delete(ref);
+      }
+      if (expected.size)
+        throw new Error(
+          "Workspace bundle is missing the selected HEAD/branch.",
+        );
+    }
     const paths = new Map<ArchiveFile, string>();
     for (const files of [
       manifest.files,
@@ -1048,9 +1117,11 @@ export async function archiveSource(
   fingerprint: string,
   limits = defaultLimits,
   makeArchive = createArchive,
+  gitHistoryScope: GitHistoryScope = "repository",
 ) {
   const current = await makeArchive(home, workspaceId, limits, {
     keepFence: true,
+    gitHistoryScope: parseGitHistoryScope(gitHistoryScope),
   });
   try {
     if (

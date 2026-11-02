@@ -1,3 +1,8 @@
+import {
+  parseGitHistoryScope,
+  requireGitHistoryScope,
+  type GitHistoryScope,
+} from "../shared/git-history";
 import { randomUUID } from "node:crypto";
 import type { RpcInput } from "@getpaseo/plugin";
 import {
@@ -44,6 +49,7 @@ type Cached = {
   plan: Plan;
   input: RpcInput<typeof previewRpc>;
   fingerprint: string;
+  gitHistoryScope: GitHistoryScope;
   expires: number;
 };
 const plans = new Map<string, Cached>();
@@ -129,10 +135,22 @@ async function preparePreview(
   )
     throw new Error("Choose different source and target hosts.");
   if (disposed) throw new Error("Transfer is shutting down.");
+  const gitHistoryScope = parseGitHistoryScope(input.gitHistoryScope);
+  if (gitHistoryScope === "workspace") {
+    for (const endpoint of [input.source, input.target]) {
+      const info = await invoke<{ gitHistoryScopes?: string[] }>(
+        endpoint,
+        { action: "info" },
+        limits,
+      );
+      requireGitHistoryScope(gitHistoryScope, info.gitHistoryScopes);
+    }
+  }
   const snap = await invoke<ExportedArchive>(
     input.source,
     {
       action: "archive-export",
+      gitHistoryScope,
       workspaceId: input.workspaceId,
       limits,
     },
@@ -140,6 +158,8 @@ async function preparePreview(
   );
   let prepared: Plan | undefined, failure: unknown;
   try {
+    if (parseGitHistoryScope(snap.gitHistoryScope) !== gitHistoryScope)
+      throw new Error("Source did not confirm the selected Git history scope.");
     if (
       input.mode === "move" &&
       snap.workspace.isolation === "worktree" &&
@@ -162,6 +182,7 @@ async function preparePreview(
     if (plans.size >= 4) plans.delete(plans.keys().next().value!);
     if (disposed) throw new Error("Transfer is shutting down.");
     const plan: Plan = {
+      gitHistoryScope,
       id: randomUUID(),
       workspace: snap.workspace,
       destination: checked.destination,
@@ -175,7 +196,8 @@ async function preparePreview(
     prepared = plan;
     plans.set(plan.id, {
       plan,
-      input,
+      input: { ...input, gitHistoryScope },
+      gitHistoryScope,
       fingerprint: snap.fingerprint,
       expires: Date.now() + 10 * 60_000,
     });
@@ -201,6 +223,10 @@ export function start({ planId }: RpcInput<typeof runRpc>) {
   const cached = plans.get(planId);
   if (!cached || cached.expires < Date.now())
     throw new Error("Preview expired. Preview this transfer again.");
+  if (
+    parseGitHistoryScope(cached.plan.gitHistoryScope) !== cached.gitHistoryScope
+  )
+    throw new Error("Git history scope changed since preview. Preview again.");
   plans.delete(planId);
   busy = true;
   const runId = randomUUID();
@@ -224,12 +250,17 @@ export function start({ planId }: RpcInput<typeof runRpc>) {
         cached.input.source,
         {
           action: "archive-export",
+          gitHistoryScope: cached.gitHistoryScope,
           workspaceId: cached.input.workspaceId,
           limits,
         },
         limits,
       );
-      if (fresh.fingerprint !== cached.fingerprint)
+      if (
+        parseGitHistoryScope(fresh.gitHistoryScope) !==
+          cached.gitHistoryScope ||
+        fresh.fingerprint !== cached.fingerprint
+      )
         throw new Error(
           "Source changed since preview. Preview it again before transferring.",
         );
@@ -258,6 +289,7 @@ export function start({ planId }: RpcInput<typeof runRpc>) {
         cached.input.target,
         {
           action: "archive-receive",
+          gitHistoryScope: cached.gitHistoryScope,
           destination: cached.plan.destination,
           file: upload,
           checksum: fresh.checksum,
@@ -280,6 +312,7 @@ export function start({ planId }: RpcInput<typeof runRpc>) {
           cached.input.source,
           {
             action: "archive-source",
+            gitHistoryScope: cached.gitHistoryScope,
             workspaceId: cached.input.workspaceId,
             fingerprint: fresh.fingerprint,
             limits,

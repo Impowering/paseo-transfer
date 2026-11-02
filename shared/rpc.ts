@@ -1,5 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
+import { gitHistoryScopes } from "./git-history";
 const endpoint = z.object({
   target: z.string().default(""),
   home: z.string().optional(),
@@ -43,6 +44,7 @@ export const previewRpc = defineRpc({
     workspaceId: z.string(),
     destination: z.string().min(1),
     mode: z.enum(["copy", "move"]),
+    gitHistoryScope: z.enum(gitHistoryScopes).optional(),
   }),
   output: z.object({
     id: z.string(),
@@ -60,6 +62,7 @@ export const previewRpc = defineRpc({
     branch: z.string().nullable(),
     skipped: z.array(z.string()),
     mode: z.enum(["copy", "move"]),
+    gitHistoryScope: z.enum(gitHistoryScopes).optional(),
   }),
 });
 export const runRpc = defineRpc({

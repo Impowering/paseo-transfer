@@ -1,5 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
+import { gitHistoryScopes } from "./git-history";
 
 export const CHUNK_BYTES = 192 * 1024;
 // Workload limits are host settings; this is only JavaScript's exact integer boundary.
@@ -26,6 +27,7 @@ const sessionSchema = z.object({
   files: z.array(fileSchema),
 });
 export const exportSchema = z.object({
+  gitHistoryScope: z.enum(gitHistoryScopes).optional(),
   workspace: workspaceSchema,
   fingerprint: z.string(),
   sourceId: z.string(),
@@ -54,6 +56,7 @@ export const hostIdentity = defineRpc({
   output: z.object({
     serverId,
     protocol: z.literal(2),
+    gitHistoryScopes: z.array(z.enum(gitHistoryScopes)).optional(),
     taskTimeoutSeconds: z.number().int().min(1).max(86400).default(3600),
   }),
 });
@@ -64,6 +67,7 @@ export const taskStart = defineRpc({
     task: z.discriminatedUnion("action", [
       z.object({
         action: z.literal("export"),
+        gitHistoryScope: z.enum(gitHistoryScopes).optional(),
         workspaceId: z.string(),
         mode: z.enum(["copy", "move"]),
       }),
@@ -74,11 +78,13 @@ export const taskStart = defineRpc({
       }),
       z.object({
         action: z.literal("receive"),
+        gitHistoryScope: z.enum(gitHistoryScopes).optional(),
         uploadId: id,
         destination: z.string().min(1),
       }),
       z.object({
         action: z.literal("archive"),
+        gitHistoryScope: z.enum(gitHistoryScopes).optional(),
         workspaceId: z.string(),
         fingerprint: z.string(),
       }),

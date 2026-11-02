@@ -1,3 +1,4 @@
+import { gitHistoryScopes, parseGitHistoryScope } from "../shared/git-history";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -53,6 +54,7 @@ export function createConnectedService(
   const identity = async () => ({
     serverId: await ownServerId(),
     protocol: 2 as const,
+    gitHistoryScopes: [...gitHistoryScopes],
     taskTimeoutSeconds: (await getLimits()).taskTimeoutSeconds,
   });
   async function guard(serverId: string) {
@@ -138,6 +140,7 @@ export function createConnectedService(
               home,
               task.workspaceId,
               limits,
+              { gitHistoryScope: parseGitHistoryScope(task.gitHistoryScope) },
             );
             entry.dir = exported.dir;
             const snap = exported.manifest;
@@ -150,6 +153,7 @@ export function createConnectedService(
                 "This worktree has Git-ignored files. Choose Copy to keep those files on the source.",
               );
             entry.status.manifest = {
+              gitHistoryScope: snap.gitHistoryScope,
               workspace: snap.workspace,
               fingerprint: exported.fingerprint,
               sourceId: snap.sourceId,
@@ -184,6 +188,8 @@ export function createConnectedService(
               task.destination,
               file(upload!),
               limits,
+              undefined,
+              parseGitHistoryScope(task.gitHistoryScope),
             );
             break;
           }
@@ -193,6 +199,8 @@ export function createConnectedService(
               task.workspaceId,
               task.fingerprint,
               limits,
+              undefined,
+              parseGitHistoryScope(task.gitHistoryScope),
             );
             break;
         }

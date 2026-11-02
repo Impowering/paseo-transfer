@@ -1386,3 +1386,481 @@ test("source branch updates are rejected even when sibling refs are allowed to a
     ),
   );
 });
+
+test("explicit workspace history transfers a complete chosen graph without repairing unrelated partial-clone objects", async () => {
+  const source = path.join(root, "history-partial-source"),
+    foreign = path.join(root, "history-partial-foreign");
+  await fs.mkdir(source);
+  const quiet = async (cwd: string, ...args: string[]) =>
+    (
+      await exec("git", args, {
+        cwd,
+        env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "" },
+      })
+    ).stdout;
+  await git(source, "init", "-b", "main");
+  await git(source, "config", "user.email", "transfer@example.test");
+  await git(source, "config", "user.name", "Transfer Test");
+  await fs.writeFile(path.join(source, "base.txt"), "base ancestor\n");
+  await fs.writeFile(
+    path.join(source, "ancestor-only.txt"),
+    "complete old ancestor blob\n",
+  );
+  await git(source, "add", ".");
+  await git(source, "commit", "-qm", "ancestor");
+  await git(source, "checkout", "-b", "selected-workspace");
+  await git(source, "rm", "ancestor-only.txt");
+  await fs.writeFile(path.join(source, "chosen.txt"), "chosen committed\n");
+  await git(source, "add", ".");
+  await git(source, "commit", "-qm", "chosen branch");
+  await fs.writeFile(
+    path.join(source, "unpublished.txt"),
+    "unpublished ancestor history\n",
+  );
+  await git(source, "add", ".");
+  await git(source, "commit", "-qm", "unpublished local commit");
+  await git(source, "tag", "selected-tag");
+  await git(
+    source,
+    "worktree",
+    "add",
+    "-b",
+    "unrelated-workspace",
+    foreign,
+    "main",
+  );
+  await fs.writeFile(
+    path.join(foreign, "foreign.bin"),
+    "foreign-only missing blob\n",
+  );
+  await git(foreign, "add", ".");
+  await git(foreign, "commit", "-qm", "unrelated history");
+  await git(foreign, "tag", "unrelated-tag");
+  const unrelatedOid = (
+    await git(foreign, "rev-parse", "HEAD:foreign.bin")
+  ).trim();
+  const selectedOid = (
+    await git(source, "rev-parse", "HEAD~2:ancestor-only.txt")
+  ).trim();
+  const object = (oid: string) =>
+    path.join(source, ".git", "objects", oid.slice(0, 2), oid.slice(2));
+  await fs.writeFile(path.join(source, "chosen.txt"), "staged chosen\n");
+  await git(source, "add", "chosen.txt");
+  await fs.writeFile(path.join(source, "chosen.txt"), "unstaged chosen\n");
+  await git(source, "rm", "base.txt");
+  await fs.writeFile(path.join(source, "untracked.txt"), "untracked source\n");
+  const marker = path.join(root, "forbidden-fetch-marker");
+  const helper = path.join(root, "forbidden-fetch.cjs");
+  await fs.writeFile(
+    helper,
+    `require('node:fs').writeFileSync(${JSON.stringify(marker)},'fetch attempted');process.exit(1);`,
+  );
+  await git(source, "config", "remote.origin.promisor", "true");
+  await git(source, "config", "remote.origin.partialclonefilter", "blob:none");
+  await git(source, "config", "protocol.ext.allow", "always");
+  await git(
+    source,
+    "config",
+    "remote.origin.url",
+    `ext::${process.execPath} ${helper}`,
+  );
+  await fs.rm(object(unrelatedOid));
+  const references = await quiet(source, "show-ref");
+  const config = await fs.readFile(path.join(source, ".git", "config"));
+  const objectFiles = async () => {
+    const { filesBelow } = await import("../server/worker");
+    return Promise.all(
+      (await filesBelow(path.join(source, ".git", "objects"))).map(
+        async (file) => [
+          path.relative(source, file),
+          createHash("sha256")
+            .update(await fs.readFile(file))
+            .digest("hex"),
+        ],
+      ),
+    );
+  };
+  const before = await objectFiles();
+  const workspace = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "local",
+    "--path",
+    source,
+  );
+  await assert.rejects(
+    createArchive(sourceHome, workspace.workspaceId),
+    /read|missing|pack-objects|bad object/i,
+  );
+  const endpoint = { target: "", home: sourceHome };
+  const capabilities = await invoke<{ gitHistoryScopes: string[] }>(endpoint, {
+    action: "info",
+  });
+  assert.ok(capabilities.gitHistoryScopes.includes("workspace"));
+  const exported = await invoke<import("../shared/types").ExportedArchive>(
+    endpoint,
+    {
+      action: "archive-export",
+      workspaceId: workspace.workspaceId,
+      gitHistoryScope: "workspace",
+    },
+  );
+  try {
+    assert.equal(exported.gitHistoryScope, "workspace");
+    const target = path.join(root, "history-workspace-target");
+    await assert.rejects(
+      receiveArchive(
+        targetHome,
+        target,
+        exported.file,
+        defaultLimits,
+        undefined,
+        "repository",
+      ),
+      /scope differs/,
+    );
+    await assert.rejects(fs.access(target));
+    const result = await receiveArchive(
+      targetHome,
+      target,
+      exported.file,
+      defaultLimits,
+      undefined,
+      "workspace",
+    );
+    assert.equal(result.verified, true);
+    assert.equal(
+      await git(target, "rev-parse", "HEAD"),
+      await quiet(source, "rev-parse", "HEAD"),
+    );
+    assert.equal(
+      await git(target, "branch", "--show-current"),
+      "selected-workspace\n",
+    );
+    assert.equal(
+      await git(target, "rev-list", "--reverse", "HEAD"),
+      await quiet(source, "rev-list", "--reverse", "HEAD"),
+    );
+    assert.equal(
+      await git(target, "for-each-ref", "--format=%(refname)"),
+      "refs/heads/selected-workspace\n",
+    );
+    assert.equal(await git(target, "tag", "--list"), "");
+    assert.equal(
+      await git(target, "show", "HEAD~2:ancestor-only.txt"),
+      "complete old ancestor blob\n",
+    );
+    assert.equal(
+      await git(target, "diff", "--cached", "--binary", "--full-index", "HEAD"),
+      await quiet(
+        source,
+        "diff",
+        "--cached",
+        "--binary",
+        "--full-index",
+        "HEAD",
+      ),
+    );
+    assert.equal(
+      await git(target, "status", "--porcelain"),
+      await quiet(source, "status", "--porcelain"),
+    );
+    assert.equal(
+      await fs.readFile(path.join(target, "chosen.txt"), "utf8"),
+      "unstaged chosen\n",
+    );
+    assert.equal(
+      await fs.readFile(path.join(target, "unpublished.txt"), "utf8"),
+      "unpublished ancestor history\n",
+    );
+    assert.equal(
+      await fs.readFile(path.join(target, "untracked.txt"), "utf8"),
+      "untracked source\n",
+    );
+    const connectedTarget = path.join(root, "history-workspace-connected");
+    const connectedPlan = await connected.preview({
+      sourceId: ids.get(sourceHome)!,
+      targetId: ids.get(targetHome)!,
+      workspaceId: workspace.workspaceId,
+      destination: connectedTarget,
+      mode: "copy",
+      gitHistoryScope: "workspace",
+    });
+    assert.equal(connectedPlan.gitHistoryScope, "workspace");
+    const connectedResult = await waitConnected(
+      connected.start(connectedPlan).runId,
+    );
+    assert.equal(connectedResult.state, "done", connectedResult.message);
+    assert.equal(
+      await git(connectedTarget, "for-each-ref", "--format=%(refname)"),
+      "refs/heads/selected-workspace\n",
+    );
+    const sshRoot = path.join(root, "history-scope-ssh");
+    await fs.mkdir(sshRoot);
+    const ssh = await sshFixture(sshRoot, { ...process.env });
+    try {
+      const rpc = getRpc(ids.get(sourceHome)!);
+      const sshTarget = path.join(root, "history-workspace-ssh");
+      const plan = await waitForSshPreview(
+        {
+          source: { target: "", home: sourceHome },
+          target: {
+            target: "127.0.0.1",
+            port: ssh.port,
+            identityFile: ssh.key,
+            knownHostsFile: ssh.known,
+            home: targetHome,
+          },
+          workspaceId: workspace.workspaceId,
+          destination: sshTarget,
+          mode: "copy",
+          gitHistoryScope: "workspace",
+        },
+        (value) => rpc(previewStartRpc, value),
+        (value) => rpc(previewStatusRpc, value),
+        () => new Promise((resolve) => setTimeout(resolve, 20)),
+        undefined,
+        () => rpc(hostIdentity, {}),
+      );
+      assert.equal(plan.gitHistoryScope, "workspace");
+      const { runId } = await rpc(runRpc, { planId: plan.id });
+      let status = await rpc(statusRpc, { runId });
+      for (
+        let attempt = 0;
+        status.state === "running" && attempt < 2000;
+        attempt++
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        status = await rpc(statusRpc, { runId });
+      }
+      assert.equal(status.state, "done", status.message);
+      assert.equal(
+        await git(sshTarget, "for-each-ref", "--format=%(refname)"),
+        "refs/heads/selected-workspace\n",
+      );
+    } finally {
+      await ssh.close();
+    }
+    assert.equal(await quiet(source, "show-ref"), references);
+    assert.deepEqual(
+      await fs.readFile(path.join(source, ".git", "config")),
+      config,
+    );
+    assert.deepEqual(await objectFiles(), before);
+    await assert.rejects(fs.access(object(unrelatedOid)));
+    await assert.rejects(fs.access(marker));
+    await assert.rejects(
+      createArchive(sourceHome, workspace.workspaceId),
+      /read|missing|pack-objects|bad object/i,
+    );
+    await fs.rm(object(selectedOid));
+    const missingSelected = await objectFiles();
+    await assert.rejects(
+      createArchive(sourceHome, workspace.workspaceId, defaultLimits, {
+        gitHistoryScope: "workspace",
+      }),
+      /read|missing|pack-objects|bad object|transport/i,
+    );
+    assert.deepEqual(await objectFiles(), missingSelected);
+    await assert.rejects(fs.access(marker));
+    assert.ok(
+      (await cli(sourceHome, "workspace", "ls")).some(
+        (row: any) => row.workspaceId === workspace.workspaceId,
+      ),
+    );
+  } finally {
+    await invoke(endpoint, { action: "archive-release", file: exported.file });
+  }
+});
+
+test("history scope is bound through standalone source checks, detached HEAD and plain folders", async () => {
+  const source = path.join(root, "history-scope-bound");
+  await fs.mkdir(source);
+  await git(source, "init", "-b", "leaf");
+  await git(source, "config", "user.email", "transfer@example.test");
+  await git(source, "config", "user.name", "Transfer Test");
+  await fs.writeFile(path.join(source, "file"), "first\n");
+  await git(source, "add", ".");
+  await git(source, "commit", "-qm", "first");
+  await fs.writeFile(path.join(source, "file"), "unpublished\n");
+  await git(source, "add", ".");
+  await git(source, "commit", "-qm", "unpublished");
+  await git(source, "branch", "other-local");
+  await git(source, "tag", "release-tag");
+  const workspace = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "local",
+    "--path",
+    source,
+  );
+  const endpoint = { target: "", home: sourceHome };
+  const scoped = await invoke<import("../shared/types").ExportedArchive>(
+    endpoint,
+    {
+      action: "archive-export",
+      workspaceId: workspace.workspaceId,
+      gitHistoryScope: "workspace",
+    },
+  );
+  const repository = await createArchive(sourceHome, workspace.workspaceId);
+  try {
+    assert.notEqual(scoped.fingerprint, repository.fingerprint);
+    await assert.rejects(
+      invoke(endpoint, {
+        action: "archive-source",
+        workspaceId: workspace.workspaceId,
+        fingerprint: scoped.fingerprint,
+        gitHistoryScope: "repository",
+      }),
+      /Source changed/,
+    );
+    assert.ok(
+      (await cli(sourceHome, "workspace", "ls")).some(
+        (row: any) => row.workspaceId === workspace.workspaceId,
+      ),
+    );
+    const { archiveWriter, unpackArchive } =
+      await import("../server/archive-format");
+    const relabelledRoot = path.join(root, "history-relabelled");
+    await fs.mkdir(relabelledRoot);
+    const unpacked = await unpackArchive(
+      repository.file,
+      relabelledRoot,
+      defaultLimits,
+    );
+    const relabelledFile = path.join(root, "history-relabelled.bin");
+    const writer = await archiveWriter(relabelledFile, defaultLimits);
+    for (const [, blob] of [...unpacked.blobs].sort(([a], [b]) => a - b))
+      await writer.add(blob.file);
+    await writer.finish({
+      ...(unpacked.manifest as object),
+      gitHistoryScope: "workspace",
+    });
+    const rejectedTarget = path.join(root, "history-relabelled-target");
+    await assert.rejects(
+      receiveArchive(
+        targetHome,
+        rejectedTarget,
+        relabelledFile,
+        defaultLimits,
+        undefined,
+        "workspace",
+      ),
+      /unexpected Git refs/,
+    );
+    await assert.rejects(fs.access(rejectedTarget));
+    const fullTarget = path.join(root, "history-full-target");
+    await receiveArchive(targetHome, fullTarget, repository.file);
+    assert.equal(
+      await git(fullTarget, "rev-parse", "other-local"),
+      await git(source, "rev-parse", "other-local"),
+    );
+    assert.equal(await git(fullTarget, "tag", "--list"), "release-tag\n");
+    await git(source, "checkout", "--detach", "HEAD");
+    const detached = await createArchive(
+      sourceHome,
+      workspace.workspaceId,
+      defaultLimits,
+      { gitHistoryScope: "workspace" },
+    );
+    try {
+      const detachedTarget = path.join(root, "history-detached-target");
+      await receiveArchive(
+        targetHome,
+        detachedTarget,
+        detached.file,
+        defaultLimits,
+        undefined,
+        "workspace",
+      );
+      assert.equal(await git(detachedTarget, "branch", "--show-current"), "");
+      assert.equal(
+        await git(detachedTarget, "for-each-ref", "--format=%(refname)"),
+        "",
+      );
+      assert.equal(
+        await git(detachedTarget, "rev-list", "--reverse", "HEAD"),
+        await git(source, "rev-list", "--reverse", "HEAD"),
+      );
+      assert.equal(
+        await fs.readFile(path.join(detachedTarget, "file"), "utf8"),
+        "unpublished\n",
+      );
+      await fs.writeFile(
+        path.join(source, ".git", "shallow"),
+        (await git(source, "rev-parse", "HEAD")).trim() + "\n",
+      );
+      await assert.rejects(
+        createArchive(sourceHome, workspace.workspaceId, defaultLimits, {
+          gitHistoryScope: "workspace",
+        }),
+        /shallow repositories/,
+      );
+      await fs.rm(path.join(source, ".git", "shallow"));
+      await invoke(endpoint, {
+        action: "archive-source",
+        workspaceId: workspace.workspaceId,
+        fingerprint: detached.fingerprint,
+        gitHistoryScope: "workspace",
+      });
+      assert.ok(
+        !(await cli(sourceHome, "workspace", "ls")).some(
+          (row: any) => row.workspaceId === workspace.workspaceId,
+        ),
+      );
+      assert.equal(await git(source, "tag", "--list"), "release-tag\n");
+      assert.equal(
+        (await git(source, "for-each-ref", "--format=%(refname)"))
+          .trim()
+          .split("\n").length,
+        3,
+      );
+    } finally {
+      await fs.rm(detached.dir, { recursive: true, force: true });
+    }
+    const plain = path.join(root, "history-non-git");
+    await fs.mkdir(plain);
+    await fs.writeFile(path.join(plain, "note"), "plain files remain complete");
+    const plainWorkspace = await cli(
+      sourceHome,
+      "workspace",
+      "create",
+      "--isolation",
+      "local",
+      "--path",
+      plain,
+    );
+    const plainArchive = await createArchive(
+      sourceHome,
+      plainWorkspace.workspaceId,
+      defaultLimits,
+      { gitHistoryScope: "workspace" },
+    );
+    try {
+      const plainTarget = path.join(root, "history-non-git-target");
+      assert.equal(plainArchive.manifest.bundle, null);
+      await receiveArchive(
+        targetHome,
+        plainTarget,
+        plainArchive.file,
+        defaultLimits,
+        undefined,
+        "workspace",
+      );
+      assert.equal(
+        await fs.readFile(path.join(plainTarget, "note"), "utf8"),
+        "plain files remain complete",
+      );
+    } finally {
+      await fs.rm(plainArchive.dir, { recursive: true, force: true });
+    }
+  } finally {
+    await invoke(endpoint, { action: "archive-release", file: scoped.file });
+    await fs.rm(repository.dir, { recursive: true, force: true });
+  }
+});

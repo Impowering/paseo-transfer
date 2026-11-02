@@ -8,6 +8,7 @@ async function handlers(
   checkFails: boolean,
   releaseFails = true,
   exported?: Promise<void>,
+  capabilities?: Record<string, boolean>,
 ) {
   const calls: string[] = [];
   const bundle = await build({
@@ -30,11 +31,21 @@ async function handlers(
     ],
   });
   const module = { exports: {} as typeof import("../server/handlers") };
-  const invoke = async (_endpoint: unknown, request: { action: string }) => {
+  const invoke = async (
+    endpoint: { target: string },
+    request: { action: string; gitHistoryScope?: string },
+  ) => {
     calls.push(request.action);
+    if (request.action === "info" && capabilities)
+      return {
+        gitHistoryScopes: capabilities[endpoint.target]
+          ? ["repository", "workspace"]
+          : undefined,
+      };
     if (request.action === "archive-export") {
       await exported;
       return {
+        gitHistoryScope: request.gitHistoryScope,
         file: "/tmp/paseo-transfer-export-ABC123/archive.bin",
         fingerprint: "fingerprint",
         checksum: "f".repeat(64),
@@ -134,4 +145,32 @@ test("SSH preview acknowledges before a long export and publishes its final plan
   assert.equal(result.state, "done");
   assert.equal(result.plan?.workspace.workspaceId, "w1");
   assert.deepEqual(calls, ["archive-export", "check", "archive-release"]);
+});
+
+test("workspace SSH plans reject unsupported workers before exporting or targeting data", async () => {
+  const { service, calls } = await handlers(false, false, undefined, {
+    studio: true,
+    mini: false,
+  });
+  await assert.rejects(
+    service.preview({ ...input, gitHistoryScope: "workspace" }),
+    /does not support workspace/,
+  );
+  assert.deepEqual(calls, ["info", "info"]);
+});
+
+test("changing a cached SSH preview's scope holds start", async () => {
+  const { service } = await handlers(false, false, undefined, {
+    studio: true,
+    mini: true,
+  });
+  const plan = await service.preview({
+    ...input,
+    gitHistoryScope: "workspace",
+  });
+  plan.gitHistoryScope = "repository";
+  assert.throws(
+    () => service.start({ planId: plan.id }),
+    /scope changed since preview/,
+  );
 });
