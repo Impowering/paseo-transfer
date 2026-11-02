@@ -848,3 +848,119 @@ test("standalone SSH workers return a large archive handle, verify receive and p
     await fixture.close();
   }
 });
+
+test("late edits to an earlier source file are refused during final source archival", async () => {
+  const { archiveWriter } = await import("../server/archive-format");
+  const { archiveSource } = await import("../server/archive");
+  const source = path.join(root, "late-source-edit");
+  await fs.mkdir(source);
+  await fs.writeFile(path.join(source, "a.txt"), "old");
+  await fs.writeFile(path.join(source, "z.bin"), Buffer.alloc(1024 * 1024));
+  const workspace = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "local",
+    "--path",
+    source,
+  );
+  for (const phase of ["late-entry", "after-export"]) {
+    await fs.writeFile(path.join(source, "a.txt"), "old");
+    const baseline = await createArchive(sourceHome, workspace.workspaceId);
+    try {
+      await assert.rejects(
+        archiveSource(
+          sourceHome,
+          workspace.workspaceId,
+          baseline.fingerprint,
+          defaultLimits,
+          async (home, id, limits, options) => {
+            const current = await createArchive(home, id, limits, {
+              ...options,
+              writer: async (file, configured) => {
+                const writer = await archiveWriter(file, configured);
+                return {
+                  ...writer,
+                  add: async (name) => {
+                    if (
+                      phase === "late-entry" &&
+                      name === path.join(source, "z.bin")
+                    )
+                      await fs.writeFile(path.join(source, "a.txt"), "NEW");
+                    return writer.add(name);
+                  },
+                };
+              },
+            });
+            if (phase === "after-export")
+              await fs.writeFile(path.join(source, "a.txt"), "NEW");
+            return current;
+          },
+        ),
+        /Source changed/,
+      );
+      assert.equal(
+        await fs.readFile(path.join(source, "a.txt"), "utf8"),
+        "NEW",
+      );
+      assert.ok(
+        (await cli(sourceHome, "workspace", "ls")).some(
+          (entry: any) => entry.workspaceId === workspace.workspaceId,
+        ),
+      );
+    } finally {
+      await fs.rm(baseline.dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("ambiguous native creation preserves a registered or unverifiable destination", async () => {
+  const source = path.join(root, "ambiguous-native-source");
+  await fs.mkdir(source);
+  await fs.writeFile(path.join(source, "file"), "preserve me");
+  const workspace = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "local",
+    "--path",
+    source,
+  );
+  const exported = await createArchive(sourceHome, workspace.workspaceId);
+  try {
+    for (const mode of ["committed", "unavailable", "pending"]) {
+      const target = path.join(root, "ambiguous-native-" + mode);
+      let reconciled = false;
+      await assert.rejects(
+        receiveArchive(targetHome, target, exported.file, defaultLimits, {
+          cli: async (home, ...args) => {
+            if (mode === "committed") await cli(home!, ...args);
+            throw new Error("native creation acknowledgement lost");
+          },
+          list: async (home) => {
+            reconciled = true;
+            if (mode === "unavailable")
+              throw new Error("native inventory unavailable");
+            return (await import("../server/worker")).list(home);
+          },
+        }),
+        /Destination preserved.*Reconcile before retrying/,
+      );
+      assert.equal(reconciled, true);
+      assert.equal(
+        await fs.readFile(path.join(target, "file"), "utf8"),
+        "preserve me",
+      );
+      if (mode === "committed")
+        assert.ok(
+          (await cli(targetHome, "workspace", "ls")).some(
+            (entry: any) => entry.cwd === target,
+          ),
+        );
+    }
+  } finally {
+    await fs.rm(exported.dir, { recursive: true, force: true });
+  }
+});

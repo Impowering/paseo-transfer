@@ -33,6 +33,10 @@ Automation can use `client/connected-transfer.ts`'s exported `createTransferClie
 
 Copied provider session IDs stay the same, while Paseo workspace and agent IDs are new. Pins, hierarchy, workspace Info fields, remote Git configuration and owner-tracker relations require separate verified reconciliation. No provider turn is started by an archive transfer. The fork checks all running agents' real checkout paths, including distinct workspace IDs sharing one directory; external ownership and do-not-archive holds still belong to the operator's preflight.
 
+Source handoff stays exclusive until native archive completes. Export retains before-read file/link tokens and a change journal, then checks the complete file inventory, Git HEAD/refs/index/ignored paths, selected workspace and conversation inventory after the long scan. A move retains that fence through a final idle probe and source check. Observed changes or unavailable monitoring retain the source. These checks do not replace the existing owner handoff with an atomic filesystem transaction.
+
+The receiver bounds blob count before extraction (the configured counted-file allowance plus two Git blobs), and framing/manifest metadata remains bounded even when file/byte policy limits are zero. An ambiguous native-create response preserves destination files and transcripts, reconciles native inventory for evidence, and requires reconciliation before a retry; an immediate absent result does not prove a delayed create cannot settle.
+
 ## Verification and recovery
 
 Transfer refuses an occupied destination or an existing native session ID. It verifies file bytes, modes, symlinks, Git HEAD, staged changes, transcript bytes, agent imports, and workspace registration. It never overwrites an existing checkout or edits Paseo's workspace/agent registry files.

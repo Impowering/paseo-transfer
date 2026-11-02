@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -142,9 +143,95 @@ test("a running writer in another workspace sharing the same real checkout holds
         assertIdleCheckout(undefined, dir, async () => [{ status: "running" }]),
         /no verified checkout/,
       );
+      const nested = path.join(dir, "nested");
+      await fs.mkdir(nested);
+      await assert.rejects(
+        assertIdleCheckout(undefined, dir, async () => [
+          { status: "running", cwd: nested },
+        ]),
+        /every running agent sharing/,
+      );
+      await assert.rejects(
+        assertIdleCheckout(undefined, nested, async () => [
+          { status: "initializing", cwd: dir },
+        ]),
+        /every running agent sharing/,
+      );
     } finally {
       await fs.rm(alias);
     }
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("receiver file and manifest budgets reject before excessive blob allocation and clean owned extraction", async () => {
+  const dir = await fs.mkdtemp(path.join(tmpdir(), "transfer-decode-budget-"));
+  try {
+    const empty = path.join(dir, "empty");
+    await fs.writeFile(empty, "");
+    const archive = path.join(dir, "blobs"),
+      writer = await archiveWriter(archive, defaultLimits);
+    const refs = [];
+    for (let index = 0; index < 8; index++) refs.push(await writer.add(empty));
+    await writer.finish({ refs });
+    const output = path.join(dir, "out");
+    await fs.mkdir(output);
+    await assert.rejects(
+      unpackArchive(archive, output, { ...defaultLimits, maxFiles: 1 }),
+      /blob count/,
+    );
+    assert.deepEqual(await fs.readdir(output), []);
+    const largeManifest = path.join(dir, "manifest"),
+      manifestWriter = await archiveWriter(largeManifest, defaultLimits);
+    await manifestWriter.finish({ padding: "x".repeat(90 * 1024) });
+    await assert.rejects(
+      unpackArchive(largeManifest, output, { ...defaultLimits, maxFiles: 1 }),
+      /manifest/,
+    );
+    assert.deepEqual(await fs.readdir(output), []);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("unlimited policy settings retain a finite framing metadata budget for zero-byte blobs", async () => {
+  const dir = await fs.mkdtemp(path.join(tmpdir(), "transfer-zero-budget-"));
+  try {
+    const archive = path.join(dir, "archive"),
+      output = path.join(dir, "out");
+    await fs.mkdir(output);
+    const file = await fs.open(archive, "wx");
+    const digest = createHash("sha256").digest("hex");
+    async function frame(value: object) {
+      const data = Buffer.from(JSON.stringify(value)),
+        size = Buffer.alloc(4);
+      size.writeUInt32BE(data.length);
+      await file.write(Buffer.concat([size, data]));
+    }
+    try {
+      await file.write("PASEO-TRANSFER-2\n");
+      for (let id = 0; id < 4300; id++) {
+        await frame({
+          type: "blob",
+          id,
+          bytes: 0,
+          padding: "x".repeat(16_000),
+        });
+        await frame({ type: "digest", id, bytes: 0, sha256: digest });
+      }
+    } finally {
+      await file.close();
+    }
+    await assert.rejects(
+      unpackArchive(archive, output, {
+        ...defaultLimits,
+        maxFiles: 0,
+        maxBytes: 0,
+      }),
+      /metadata budget/,
+    );
+    assert.deepEqual(await fs.readdir(output), []);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }

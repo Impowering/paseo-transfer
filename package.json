@@ -7,10 +7,10 @@
   "author": "Tom Gringauz",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tomgrin10/paseo-transfer.git"
+    "url": "git+https://github.com/Impowering/paseo-transfer.git"
   },
-  "homepage": "https://github.com/tomgrin10/paseo-transfer#readme",
-  "bugs": "https://github.com/tomgrin10/paseo-transfer/issues",
+  "homepage": "https://github.com/Impowering/paseo-transfer#readme",
+  "bugs": "https://github.com/Impowering/paseo-transfer/issues",
   "keywords": [
     "paseo",
     "paseo-plugin",

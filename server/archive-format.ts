@@ -8,6 +8,12 @@ const MAGIC = Buffer.from("PASEO-TRANSFER-2\n");
 const IO_BYTES = 256 * 1024;
 const MAX_HEADER_BYTES = 16 * 1024;
 export const MAX_MANIFEST_BYTES = 64 * 1024 * 1024;
+// Metadata is bounded even when the caller explicitly removes file/byte policy limits.
+export function metadataBudget(limits: TransferLimits) {
+  return limits.maxFiles === 0
+    ? MAX_MANIFEST_BYTES
+    : Math.min(MAX_MANIFEST_BYTES, 64 * 1024 + limits.maxFiles * 16 * 1024);
+}
 export interface BlobRef {
   id: number;
   bytes: number;
@@ -27,7 +33,8 @@ export async function archiveWriter(file: string, limits: TransferLimits) {
   const wire = createHash("sha256");
   let wireBytes = 0,
     bytes = 0,
-    sequence = 0;
+    sequence = 0,
+    headerBytes = 0;
   async function write(buffer: Buffer) {
     enforceLimit(wireBytes + buffer.length, limits.maxBytes, "Archive bytes");
     let offset = 0;
@@ -40,6 +47,9 @@ export async function archiveWriter(file: string, limits: TransferLimits) {
     const data = Buffer.from(JSON.stringify(value));
     if (data.length > MAX_HEADER_BYTES)
       throw new Error("Archive header is too large.");
+    headerBytes += data.length + 4;
+    if (headerBytes > metadataBudget(limits))
+      throw new Error("Archive framing exceeds the metadata budget.");
     const size = Buffer.alloc(4);
     size.writeUInt32BE(data.length);
     await write(size);
@@ -85,7 +95,7 @@ export async function archiveWriter(file: string, limits: TransferLimits) {
     },
     async finish(manifest: object) {
       const data = Buffer.from(JSON.stringify(manifest));
-      if (data.length > MAX_MANIFEST_BYTES)
+      if (data.length > metadataBudget(limits))
         throw new Error("Archive metadata exceeds the bounded manifest size.");
       const fingerprint = createHash("sha256").update(data).digest("hex");
       await header({ type: "manifest", bytes: data.length });
@@ -117,10 +127,12 @@ export async function unpackArchive(
 ) {
   const input = await fs.open(file, "r");
   const blobs = new Map<number, { file: string; ref: BlobRef }>();
+  const created = new Set<string>();
   let pending: { file: string; ref: BlobRef } | null = null;
   let manifest: unknown,
     fingerprint = "",
-    total = 0;
+    total = 0,
+    headerBytes = 0;
   try {
     if (!(await exact(input, MAGIC.length)).equals(MAGIC))
       throw new Error("Unsupported transfer archive.");
@@ -128,6 +140,9 @@ export async function unpackArchive(
       const length = (await exact(input, 4)).readUInt32BE();
       if (!length || length > MAX_HEADER_BYTES)
         throw new Error("Invalid archive header size.");
+      headerBytes += length + 4;
+      if (headerBytes > metadataBudget(limits))
+        throw new Error("Archive framing exceeds the metadata budget.");
       const record = JSON.parse((await exact(input, length)).toString());
       if (record.type === "blob") {
         if (
@@ -140,8 +155,15 @@ export async function unpackArchive(
           throw new Error("Invalid or duplicate archive blob.");
         enforceLimit(record.bytes, limits.maxFileBytes, "File bytes");
         enforceLimit(total + record.bytes, limits.maxBytes, "Workspace bytes");
+        // At most one blob per counted file plus the Git bundle and binary index patch.
+        // The exact file/symlink/deleted/transcript count is also checked in the manifest.
+        if (limits.maxFiles && blobs.size >= limits.maxFiles + 2)
+          throw new Error(
+            "Archive blob count exceeds this host's configured file limit.",
+          );
         const target = path.join(directory, String(record.id));
         const output = await fs.open(target, "wx", 0o600);
+        created.add(target);
         const hash = createHash("sha256");
         try {
           let remaining = record.bytes;
@@ -181,7 +203,7 @@ export async function unpackArchive(
           manifest ||
           !Number.isSafeInteger(record.bytes) ||
           record.bytes < 1 ||
-          record.bytes > MAX_MANIFEST_BYTES
+          record.bytes > metadataBudget(limits)
         )
           throw new Error("Invalid archive manifest.");
         const data = await exact(input, record.bytes);
@@ -195,6 +217,9 @@ export async function unpackArchive(
         return { manifest, blobs, fingerprint, bytes: total };
       } else throw new Error("Unknown transfer archive frame.");
     }
+  } catch (error) {
+    await Promise.all([...created].map((file) => fs.rm(file, { force: true })));
+    throw error;
   } finally {
     await input.close();
   }

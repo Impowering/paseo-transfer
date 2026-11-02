@@ -33,6 +33,7 @@ import {
   unpackArchive,
   type BlobRef,
 } from "./archive-format";
+import { SourceFence } from "./source-fence";
 
 interface ArchiveFile {
   path: string;
@@ -119,7 +120,8 @@ export async function assertIdleCheckout(
       throw new Error(
         "A running agent has no verified checkout; transfer held.",
       );
-    if ((await fs.realpath(agent.cwd)) === canonical)
+    const agentPath = await fs.realpath(agent.cwd);
+    if (inside(canonical, agentPath) || inside(agentPath, canonical))
       throw new Error(
         "Stop every running agent sharing this checkout before transferring it.",
       );
@@ -130,6 +132,7 @@ async function sessionSources(
   home: string | undefined,
   workspace: Workspace,
   limits: TransferLimits,
+  fence?: SourceFence,
 ) {
   const records = await filesBelow(
     path.join(paseoHome(home), "agents"),
@@ -143,8 +146,10 @@ async function sessionSources(
   }> = [];
   const seen = new Set<string>();
   for (const file of records.filter((name) => name.endsWith(".json"))) {
+    const version = fence ? await fence.version(file) : undefined;
     const record = JSON.parse(await fs.readFile(file, "utf8"));
     if (record.workspaceId !== workspace.workspaceId) continue;
+    if (fence) await fence.watchFile(file, version);
     const id = record.persistence?.sessionId,
       provider = record.provider;
     if (!id || !["claude", "codex"].includes(provider))
@@ -200,10 +205,89 @@ async function sessionSources(
   return result;
 }
 
+async function gitSourceState(
+  cwd: string,
+  dir: string,
+  name: string,
+  limits: TransferLimits,
+) {
+  if ((await command("git", ["ls-files", "-u"], cwd)).trim())
+    throw new Error("Source Git state changed: unresolved index entries.");
+  const head = (await command("git", ["rev-parse", "HEAD"], cwd)).trim();
+  let branch: string | null = null;
+  try {
+    branch = (
+      await command("git", ["symbolic-ref", "--short", "HEAD"], cwd)
+    ).trim();
+  } catch {
+    /* detached HEAD */
+  }
+  const refs = await command(
+    "git",
+    ["for-each-ref", "--format=%(refname)%00%(objectname)"],
+    cwd,
+  );
+  const names = [
+    ...new Set(
+      (
+        await command(
+          "git",
+          ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+          cwd,
+        )
+      )
+        .split("\0")
+        .filter(Boolean),
+    ),
+  ].sort();
+  const ignored = (
+    await command(
+      "git",
+      [
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "-z",
+      ],
+      cwd,
+    )
+  )
+    .split("\0")
+    .filter(Boolean)
+    .sort();
+  const patch = path.join(dir, name + ".patch");
+  await outputFile(
+    "git",
+    ["diff", "--cached", "--binary", "--full-index", "HEAD"],
+    cwd,
+    patch,
+    limits,
+  );
+  const patchHash = await hashFile(patch);
+  return {
+    head,
+    branch,
+    names,
+    ignored,
+    patch,
+    signature: JSON.stringify({
+      head,
+      branch,
+      refs,
+      names,
+      ignored,
+      patchHash,
+    }),
+  };
+}
+
 export async function createArchive(
   home: string | undefined,
   workspaceId: string,
   limits = defaultLimits,
+  options: { keepFence?: boolean; writer?: typeof archiveWriter } = {},
 ) {
   const workspace = (await list(home)).find(
     (entry) => entry.workspaceId === workspaceId,
@@ -219,15 +303,20 @@ export async function createArchive(
     throw new Error("Workspace root must not be a symlink.");
   const dir = await privateDirectory("paseo-transfer-export-");
   const file = path.join(dir, "archive.bin");
-  const writer = await archiveWriter(file, limits).catch(async (error) => {
-    await fs.rm(dir, { recursive: true, force: true });
-    throw error;
-  });
+  const writer = await (options.writer ?? archiveWriter)(file, limits).catch(
+    async (error) => {
+      await fs.rm(dir, { recursive: true, force: true });
+      throw error;
+    },
+  );
+  const fence = new SourceFence();
   let count = 0;
   async function entry(root: string, relative: string): Promise<ArchiveFile> {
     enforceLimit(++count, limits.maxFiles, "File count");
     safeRelative(relative);
     const full = path.join(root, relative);
+    if (inside(cwd, full)) await fence.track(full);
+    else await fence.watchFile(full);
     if (!inside(await fs.realpath(root), await fs.realpath(path.dirname(full))))
       throw new Error(`File leaves the workspace: ${relative}`);
     const stat = await fs.lstat(full);
@@ -248,6 +337,20 @@ export async function createArchive(
     };
   }
   try {
+    let excluded: string[] = [];
+    const selected = new Set<string>();
+    fence.watchTree(
+      cwd,
+      (relative) =>
+        relative === ".git" ||
+        (!relative.startsWith(".git/") &&
+          (selected.has(relative) ||
+            !excluded.some(
+              (name) => relative === name || relative.startsWith(name + "/"),
+            ))),
+    );
+    await fence.track(cwd);
+    await fence.watchFile(path.join(paseoHome(home), "server-id"));
     const manifest: Manifest = {
       version: 2,
       sourceId: (
@@ -272,6 +375,7 @@ export async function createArchive(
       /* directory workspace */
     }
     let names: string[];
+    let baselineGit: Awaited<ReturnType<typeof gitSourceState>> | undefined;
     if (gitRoot) {
       if ((await fs.realpath(gitRoot)) !== (await fs.realpath(cwd)))
         throw new Error(
@@ -283,28 +387,40 @@ export async function createArchive(
         throw new Error(
           "Resolve Git conflicts before transferring this workspace.",
         );
-      manifest.hasIgnored = !!(await command(
-        "git",
-        [
-          "ls-files",
-          "--others",
-          "--ignored",
-          "--exclude-standard",
-          "--directory",
-          "-z",
-        ],
+      const gitDir = (
+        await command("git", ["rev-parse", "--absolute-git-dir"], cwd)
+      ).trim();
+      const commonDir = path.resolve(
         cwd,
-      ));
-      manifest.head = (await command("git", ["rev-parse", "HEAD"], cwd)).trim();
-      try {
-        manifest.branch = (
-          await command("git", ["symbolic-ref", "--short", "HEAD"], cwd)
-        ).trim();
-      } catch {
-        /* detached HEAD */
-      }
-      const bundle = path.join(dir, "repo.bundle"),
-        patch = path.join(dir, "index.patch");
+        (await command("git", ["rev-parse", "--git-common-dir"], cwd)).trim(),
+      );
+      fence.watchTree(
+        gitDir,
+        (name) =>
+          [
+            "HEAD",
+            "HEAD.lock",
+            "index",
+            "index.lock",
+            "MERGE_HEAD",
+            "packed-refs",
+            "packed-refs.lock",
+            "refs",
+          ].includes(name) || name.startsWith("refs/"),
+      );
+      if ((await fs.realpath(commonDir)) !== (await fs.realpath(gitDir)))
+        fence.watchTree(
+          commonDir,
+          (name) =>
+            ["packed-refs", "packed-refs.lock", "refs"].includes(name) ||
+            name.startsWith("refs/"),
+        );
+      baselineGit = await gitSourceState(cwd, dir, "initial", limits);
+      manifest.hasIgnored = baselineGit.ignored.length > 0;
+      manifest.head = baselineGit.head;
+      manifest.branch = baselineGit.branch;
+      excluded = baselineGit.ignored.map((name) => name.replace(/\/$/, ""));
+      const bundle = path.join(dir, "repo.bundle");
       await outputFile(
         "git",
         ["bundle", "create", bundle, "--all", "HEAD"],
@@ -314,29 +430,11 @@ export async function createArchive(
       );
       manifest.bundle = await writer.add(bundle);
       await fs.rm(bundle);
-      await outputFile(
-        "git",
-        ["diff", "--cached", "--binary", "HEAD"],
-        cwd,
-        patch,
-        limits,
-      );
-      manifest.indexPatch = await writer.add(patch);
-      await fs.rm(patch);
-      names = [
-        ...new Set(
-          (
-            await command(
-              "git",
-              ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-              cwd,
-            )
-          )
-            .split("\0")
-            .filter(Boolean),
-        ),
-      ].sort();
-    } else
+      manifest.indexPatch = await writer.add(baselineGit.patch);
+      await fs.rm(baselineGit.patch);
+      names = baselineGit.names;
+    } else {
+      excluded = [".git", "node_modules", ".venv", "__pycache__"];
       names = (
         await filesBelow(
           cwd,
@@ -345,21 +443,89 @@ export async function createArchive(
           limits.maxFiles,
         )
       ).map((name) => path.relative(cwd, name));
+    }
+    for (const name of names) selected.add(name);
     enforceLimit(names.length, limits.maxFiles, "File count");
     for (const name of names) {
-      if (!(await exists(path.join(cwd, name)))) manifest.deleted.push(name);
-      else manifest.files.push(await entry(cwd, name));
+      if (!(await exists(path.join(cwd, name)))) {
+        await fence.track(path.join(cwd, name));
+        manifest.deleted.push(name);
+      } else manifest.files.push(await entry(cwd, name));
     }
-    for (const source of await sessionSources(home, workspace, limits)) {
+    const sources = await sessionSources(home, workspace, limits, fence);
+    for (const source of sources) {
       const files = [];
       for (const name of source.names)
         files.push(await entry(source.root, name));
       manifest.sessions.push({ ...source.session, files });
     }
+    let verification = 0;
+    const verifySource = async () => {
+      const currentWorkspace = (await list(home)).find(
+        (entry) => entry.workspaceId === workspaceId,
+      );
+      if (JSON.stringify(currentWorkspace) !== JSON.stringify(workspace))
+        throw new Error(
+          "Source workspace changed during transfer preparation.",
+        );
+      if (baselineGit) {
+        const state = await gitSourceState(
+          cwd,
+          dir,
+          `verify-${++verification}`,
+          limits,
+        );
+        try {
+          if (state.signature !== baselineGit.signature) {
+            const before = JSON.parse(baselineGit.signature),
+              after = JSON.parse(state.signature);
+            const fields = Object.keys(before).filter(
+              (key) =>
+                JSON.stringify(before[key]) !== JSON.stringify(after[key]),
+            );
+            throw new Error(
+              `Source Git state changed during transfer preparation (${fields.join(", ")}).`,
+            );
+          }
+        } finally {
+          await fs.rm(state.patch, { force: true });
+        }
+      } else {
+        const current = (
+          await filesBelow(
+            cwd,
+            (name) => !excluded.includes(name),
+            limits.maxFiles,
+          )
+        ).map((name) => path.relative(cwd, name));
+        if (JSON.stringify(current) !== JSON.stringify(names))
+          throw new Error(
+            "Source file inventory changed during transfer preparation.",
+          );
+      }
+      if (
+        JSON.stringify(await sessionSources(home, workspace, limits)) !==
+        JSON.stringify(sources)
+      )
+        throw new Error(
+          "Source conversations changed during transfer preparation.",
+        );
+      await fence.assertUnchanged();
+    };
     await assertIdleCheckout(home, cwd);
     const result = await writer.finish(manifest);
-    return { dir, file, manifest, ...result };
+    await verifySource();
+    if (!options.keepFence) fence.close();
+    return {
+      dir,
+      file,
+      manifest,
+      ...result,
+      verifySource,
+      closeSourceFence: () => fence.close(),
+    };
   } catch (error) {
+    fence.close();
     await writer.close().catch(() => {});
     await fs.rm(dir, { recursive: true, force: true });
     throw error;
@@ -488,10 +654,13 @@ export async function receiveArchive(
   destination: string,
   file: string,
   limits = defaultLimits,
+  native = { cli, list },
 ): Promise<TransferResult> {
   const dir = await privateDirectory("paseo-transfer-receive-");
   const nativeCreated: string[] = [];
   let registered = false,
+    registrationAttempted = false,
+    registrationEvidence = "",
     reserved = false,
     target = "";
   try {
@@ -654,7 +823,7 @@ export async function receiveArchive(
       const verify = path.join(dir, "verify.patch");
       await outputFile(
         "git",
-        ["diff", "--cached", "--binary", "HEAD"],
+        ["diff", "--cached", "--binary", "--full-index", "HEAD"],
         target,
         verify,
         limits,
@@ -685,7 +854,8 @@ export async function receiveArchive(
         );
       }
     }
-    const workspace = await cli(
+    registrationAttempted = true;
+    const workspace = await native.cli(
       home,
       "workspace",
       "create",
@@ -696,6 +866,8 @@ export async function receiveArchive(
       "--title",
       manifest.workspace.name,
     );
+    if (!workspace?.workspaceId)
+      throw new Error("Native workspace creation returned no verified ID.");
     registered = true;
     const agents: string[] = [];
     for (const session of manifest.sessions) {
@@ -736,12 +908,28 @@ export async function receiveArchive(
       sourceArchived: false,
     };
   } catch (error) {
-    if (!registered) {
+    if (!registered && registrationAttempted) {
+      // A failed acknowledgement does not establish that native creation failed or stopped.
+      // Reconcile for the operator, but preserve even a currently absent/unknown late result.
+      try {
+        const rows = await native.list(home);
+        const matches = rows.filter(
+          (entry) => path.resolve(entry.cwd) === path.resolve(target),
+        );
+        registered = matches.length > 0;
+        registrationEvidence = matches.length
+          ? ` Native registration observed: ${matches.map((entry) => entry.workspaceId).join(", ")}.`
+          : " Native registration is not yet observed; creation may still settle.";
+      } catch {
+        registrationEvidence = " Native registration readback is unavailable.";
+      }
+    }
+    if (!registered && !registrationAttempted) {
       if (reserved) await fs.rm(target, { recursive: true, force: true });
       for (const file of nativeCreated) await fs.rm(file, { force: true });
     }
     throw new Error(
-      `${(error as Error).message}${registered ? ` Destination preserved at ${target}; source has not been archived.` : ""}`,
+      `${(error as Error).message}${registered || registrationAttempted ? ` Destination preserved at ${target}; source has not been archived.${registrationEvidence} Reconcile before retrying.` : ""}`,
     );
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
@@ -753,8 +941,11 @@ export async function archiveSource(
   workspaceId: string,
   fingerprint: string,
   limits = defaultLimits,
+  makeArchive = createArchive,
 ) {
-  const current = await createArchive(home, workspaceId, limits);
+  const current = await makeArchive(home, workspaceId, limits, {
+    keepFence: true,
+  });
   try {
     if (
       current.manifest.workspace.isolation === "worktree" &&
@@ -768,10 +959,12 @@ export async function archiveSource(
         "Source changed during transfer; destination is verified but source was kept open.",
       );
     await assertIdleCheckout(home, current.manifest.workspace.cwd);
+    await current.verifySource();
     await cli(home, "workspace", "archive", workspaceId);
     if ((await list(home)).some((entry) => entry.workspaceId === workspaceId))
       throw new Error("Source archive verification failed.");
   } finally {
+    current.closeSourceFence();
     await fs.rm(current.dir, { recursive: true, force: true });
   }
 }
