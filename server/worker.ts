@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
+import { defaultLimits } from "../shared/limits";
 import type {
   FileEntry,
   Session,
@@ -15,22 +16,22 @@ import type {
 
 const exec = promisify(execFile);
 const MAX_BYTES = 128 * 1024 * 1024;
-const MAX_FILES = 20_000;
+const MAX_FILES = defaultLimits.maxFiles;
 const UUID = /^[a-f0-9-]{36}$/i;
-function paseoHome(home?: string) {
+export function paseoHome(home?: string) {
   const value =
     home ?? process.env.PASEO_HOME ?? path.join(homedir(), ".paseo");
   return path.resolve(
     value.startsWith("~/") ? path.join(homedir(), value.slice(2)) : value,
   );
 }
-function claudeHome() {
+export function claudeHome() {
   return process.env.CLAUDE_CONFIG_DIR ?? path.join(homedir(), ".claude");
 }
-function codexHome() {
+export function codexHome() {
   return process.env.CODEX_HOME ?? path.join(homedir(), ".codex");
 }
-function commandEnvironment() {
+export function commandEnvironment() {
   const env = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
   // Calls use the chosen daemon's local credential, never an originating agent's scope or password.
   for (const key of [
@@ -43,17 +44,25 @@ function commandEnvironment() {
     delete (env as NodeJS.ProcessEnv)[key];
   return env;
 }
-async function command(bin: string, args: string[], cwd?: string) {
+export async function command(
+  bin: string,
+  args: string[],
+  cwd?: string,
+  timeout = 120_000,
+) {
   return (
     await exec(bin, args, {
       cwd,
-      timeout: 120_000,
+      timeout,
       maxBuffer: MAX_BYTES,
       env: commandEnvironment(),
     })
   ).stdout;
 }
-async function cli(home: string | undefined, ...args: string[]): Promise<any> {
+export async function cli(
+  home: string | undefined,
+  ...args: string[]
+): Promise<any> {
   const text = await command(process.env.PASEO_SYNC_CLI ?? "paseo", [
     "--home",
     paseoHome(home),
@@ -65,7 +74,7 @@ async function cli(home: string | undefined, ...args: string[]): Promise<any> {
     throw new Error(data.error.message ?? "Paseo command failed");
   return data;
 }
-async function exists(file: string) {
+export async function exists(file: string) {
   try {
     await fs.lstat(file);
     return true;
@@ -74,7 +83,7 @@ async function exists(file: string) {
     throw e;
   }
 }
-function safeRelative(file: string) {
+export function safeRelative(file: string) {
   if (
     !file ||
     file.includes("\0") ||
@@ -85,15 +94,16 @@ function safeRelative(file: string) {
     throw new Error(`Unsafe snapshot path: ${file}`);
   return file;
 }
-function inside(root: string, file: string) {
+export function inside(root: string, file: string) {
   const rel = path.relative(root, file);
   return (
     !rel.startsWith(".." + path.sep) && rel !== ".." && !path.isAbsolute(rel)
   );
 }
-async function filesBelow(
+export async function filesBelow(
   root: string,
   filter: (name: string) => boolean = () => true,
+  maxFiles = MAX_FILES,
 ): Promise<string[]> {
   if (!(await exists(root))) return [];
   const result: string[] = [];
@@ -117,8 +127,8 @@ async function filesBelow(
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) await walk(full);
       else result.push(full);
-      if (result.length > MAX_FILES)
-        throw new Error(`Workspace exceeds ${MAX_FILES} files`);
+      if (maxFiles && result.length > maxFiles)
+        throw new Error(`Workspace exceeds ${maxFiles} files`);
     }
   }
   await walk(root);
@@ -256,7 +266,7 @@ async function version() {
     throw new Error(`Paseo 0.11.0 or newer is required (found ${value})`);
   return value;
 }
-async function list(home?: string): Promise<Workspace[]> {
+export async function list(home?: string): Promise<Workspace[]> {
   await version();
   return cli(home, "workspace", "ls");
 }
@@ -425,15 +435,19 @@ export function resolveDestination(destination: string) {
     throw new Error("Destination must be an absolute path or start with ~/.");
   return path.resolve(expanded);
 }
-async function sessionRoot(session: Session, destination: string) {
+export async function sessionRoot(
+  session: Pick<Session, "provider">,
+  destination: string,
+) {
   return session.provider === "claude"
     ? path.join(claudeHome(), "projects", claudeProjectDir(destination))
     : codexHome();
 }
-async function check(
+export async function check(
   home: string | undefined,
   destination: string,
   sessions: Session[],
+  maxFiles = MAX_FILES,
 ) {
   await version();
   await cli(home, "workspace", "ls");
@@ -459,6 +473,7 @@ async function check(
         ["sessions", "archived_sessions"].includes(name) ||
         /^\d/.test(name) ||
         name.endsWith(".jsonl"),
+      maxFiles,
     )) {
       if (
         path.basename(file) === `${session.id}.jsonl` ||
@@ -474,7 +489,7 @@ async function check(
   }
   return { destination: target };
 }
-function rewriteTranscript(
+export function rewriteTranscript(
   file: FileEntry,
   source: string,
   target: string,

@@ -33,7 +33,7 @@
     "test": "tsx --test tests/*.test.ts",
     "verify": "npm run prepare && npm run typecheck && npm run format:check && npm test && node --test button-visibility.test.mjs && node --test --experimental-strip-types agent-tools.test.mjs && node --test native-tools.test.mjs",
     "test:live": "tsx scripts/live-test.ts",
-    "format:check": "prettier --check index.client.tsx index.server.ts client server shared/types.ts shared/connected.ts shared/rpc.ts shared/display.ts tests scripts README.md CHANGELOG.md PRODUCT.md DESIGN.md package.json paseo-plugin.json tsconfig.json"
+    "format:check": "prettier --check index.client.tsx index.server.ts client server shared/types.ts shared/connected.ts shared/rpc.ts shared/display.ts shared/limits.ts tests scripts README.md CHANGELOG.md PRODUCT.md DESIGN.md package.json paseo-plugin.json tsconfig.json"
   },
   "devDependencies": {
     "@getpaseo/client": "0.14.0",

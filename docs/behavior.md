@@ -15,7 +15,21 @@ See the [README](../README.md) for installation and usage.
 
 Git-ignored files such as `.env`, dependencies, provider credentials, daemon credentials, repository config/hooks, terminals, schedules, workspace pins, and provider-specific launch settings stay on the source. Imported agents use the target host's provider configuration. Conversation text stays intact; only structural `cwd` fields are translated.
 
-Unsupported providers or missing saved conversations block the transfer rather than silently dropping history. Submodules, repositories without a commit, Git subdirectory workspaces, unmerged Git indexes, escaping symlinks, and snapshots above **128 MiB / 20,000 files** are not supported.
+Unsupported providers or missing saved conversations block the transfer rather than silently dropping history. Submodules, repositories without a commit, Git subdirectory workspaces, unmerged Git indexes, and escaping symlinks are not supported.
+
+## Large connected transfers in the Impower fork
+
+Connected transfers use protocol 2: a private disk-spooled archive with length-delimited binary blobs, per-blob SHA-256 digests, a bounded metadata manifest, and a full wire checksum. Files, Git bundles, index patches and native transcripts never become one large JSON/base64 string. The existing ordered 192 KiB RPC chunks relay the archive; receiver extraction reads at most 256 KiB of file data at a time. Both hosts must run the same protocol; upstream protocol 1 is refused.
+
+The host-scoped `limits` settings are registered through Paseo's settings API. Defaults are `maxFiles: 100000`, `maxBytes: 17179869184` (16 GiB including archive framing), `maxFileBytes: 4294967296` (4 GiB), `commandTimeoutSeconds: 900`, and `taskTimeoutSeconds: 3600`. Zero removes a file/byte policy limit. Integer validation, bounded framing, path checks, destination ownership and digest verification remain mandatory. The receiver applies its own limits and requires temporary free space for the upload, extracted verification data and destination. Source and destination settings can differ; a stricter destination refuses the upload or extraction.
+
+`transfer.identity` advertises `protocol: 2` and the host's task timeout. Connected task polling uses that advertised bound. Large Git bundle creation, fetch, checkout and binary-index operations use the configured command bound. The transfer's chunk-relay loop is not constrained by the former fifteen-minute task constant. The compact manifest is bounded to 64 MiB and each native transcript JSONL row to 16 MiB; malformed or oversized metadata is refused without source archival.
+
+The advanced SSH route retains its bounded legacy JSON snapshot transport and 128 MiB decoded snapshot limit. Use connected protocol 2 for large repositories. Legacy source discovery no longer assumes a 20,000-file maximum, but SSH is not an unbounded streaming transport.
+
+Automation can use `client/connected-transfer.ts`'s exported `createTransferClient(getRpc)` with an authenticated per-server RPC function. `preview({sourceId,targetId,workspaceId,destination,mode})` returns a fingerprint-bound plan; `start(plan)` returns a run ID; `status(runId)` reports completion and the exact new workspace/agent IDs. The injected RPC calls `DaemonClient.invokePluginRpc("transfer", contract.name, input)` and validates `contract.output`. This is the same preview/re-export/ordered upload/receive/final source-check flow used by the UI, not a bypass. Native agent tools remain read-only discovery/status tools.
+
+Copied provider session IDs stay the same, while Paseo workspace and agent IDs are new. Pins, hierarchy, workspace Info fields, remote Git configuration and owner-tracker relations require separate verified reconciliation. No provider turn is started by an archive transfer. The fork checks all running agents' real checkout paths, including distinct workspace IDs sharing one directory; external ownership and do-not-archive holds still belong to the operator's preflight.
 
 ## Verification and recovery
 

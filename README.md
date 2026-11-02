@@ -7,6 +7,14 @@
 
 Copy or move a workspace to another host, with Git history, local changes, and Claude/Codex conversations.
 
+This Impower fork adds disk-spooled connected transfers for large repositories. It defaults to 100,000 files and 16 GiB per archive, with configurable host limits and incremental verification. Install the same reviewed commit on both hosts:
+
+```sh
+paseo plugin install git:Impowering/paseo-transfer --ref <reviewed-commit>
+```
+
+The runtime plugin ID remains `transfer`. Connected protocol 2 requires this fork on both ends; it does not silently interoperate with upstream protocol 1. Paseo 0.14.0+ is still required. The upstream npm install command below installs the original release.
+
 ![Transfer popup with the current workspace selected and a verified copy preview](docs/screenshots/transfer.png)
 
 Example using fixture workspace and host data.

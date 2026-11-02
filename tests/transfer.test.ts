@@ -1,6 +1,6 @@
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -30,6 +30,8 @@ import { invoke, sshArgs, shellQuote } from "../server/transport";
 import { sshHosts, tailscaleHosts } from "../server/discovery";
 import { sshFixture } from "../scripts/ssh-fixture";
 import { preview, start, status } from "../server/handlers";
+import { createArchive, receiveArchive } from "../server/archive";
+import { defaultLimits } from "../shared/limits";
 const exec = promisify(execFile);
 let root: string, sourceHome: string, targetHome: string, repo: string;
 const daemons: ReturnType<typeof spawn>[] = [];
@@ -48,8 +50,8 @@ const connected = createTransferClient(
   getRpc,
   () => new Promise((resolve) => setTimeout(resolve, 20)),
 );
-async function waitConnected(runId: string) {
-  const deadline = Date.now() + 120_000;
+async function waitConnected(runId: string, timeout = 120_000) {
+  const deadline = Date.now() + timeout;
   while (connected.status(runId).state === "running" && Date.now() < deadline)
     await new Promise((resolve) => setTimeout(resolve, 20));
   return connected.status(runId);
@@ -624,5 +626,136 @@ test("encrypted SSH transports push and pull between separate daemon homes", asy
     );
   } finally {
     await fixture.close();
+  }
+});
+
+test("connected archive transfers over 20,000 files and 256 MiB wire with full Git and index verification", async () => {
+  const source = path.join(root, "large-monorepo");
+  await fs.mkdir(source);
+  await git(source, "init", "-b", "main");
+  await git(source, "config", "user.email", "transfer@example.test");
+  await git(source, "config", "user.name", "Transfer Test");
+  const count = 20_005;
+  for (let start = 0; start < count; start += 64)
+    await Promise.all(
+      Array.from({ length: Math.min(64, count - start) }, (_, offset) =>
+        fs.writeFile(
+          path.join(source, `file-${start + offset}.txt`),
+          `content ${start + offset}\n`,
+        ),
+      ),
+    );
+  const large = await fs.open(path.join(source, "large.bin"), "wx");
+  try {
+    for (let index = 0; index < 129; index++) {
+      const data = randomBytes(1024 * 1024);
+      let offset = 0;
+      while (offset < data.length)
+        offset += (await large.write(data, offset)).bytesWritten;
+    }
+  } finally {
+    await large.close();
+  }
+  await git(source, "add", ".");
+  await git(source, "commit", "-qm", "large monorepo fixture");
+  await git(source, "branch", "unpublished");
+  await fs.writeFile(path.join(source, "file-0.txt"), "staged\n");
+  await git(source, "add", "file-0.txt");
+  await fs.writeFile(path.join(source, "file-0.txt"), "unstaged\n");
+  const workspace = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "local",
+    "--path",
+    source,
+  );
+  const target = path.join(root, "large-monorepo-copy");
+  const plan = await connected.preview({
+    sourceId: ids.get(sourceHome)!,
+    targetId: ids.get(targetHome)!,
+    workspaceId: workspace.workspaceId,
+    destination: target,
+    mode: "copy",
+  });
+  assert.ok(plan.files > 20_000);
+  assert.ok(plan.connected.manifest.wireBytes > 256 * 1024 * 1024);
+  const copied = await waitConnected(connected.start(plan).runId, 300_000);
+  assert.equal(copied.state, "done", copied.message);
+  assert.equal(copied.result?.verified, true);
+  assert.equal(copied.result?.sourceArchived, false);
+  assert.equal(
+    await git(target, "rev-parse", "HEAD"),
+    await git(source, "rev-parse", "HEAD"),
+  );
+  assert.equal(
+    await git(target, "rev-parse", "unpublished"),
+    await git(source, "rev-parse", "unpublished"),
+  );
+  assert.equal(
+    await git(target, "diff", "--cached", "--binary", "HEAD"),
+    await git(source, "diff", "--cached", "--binary", "HEAD"),
+  );
+  assert.equal(
+    await git(target, "status", "--porcelain"),
+    await git(source, "status", "--porcelain"),
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(target, "file-20004.txt")),
+    await fs.readFile(path.join(source, "file-20004.txt")),
+  );
+  assert.equal(
+    (await fs.stat(path.join(target, "large.bin"))).size,
+    129 * 1024 * 1024,
+  );
+});
+
+test("archive receive rejects malformed data without retaining a destination or private spool", async () => {
+  const source = path.join(root, "malformed-source");
+  await fs.mkdir(source);
+  await fs.writeFile(path.join(source, "file"), "original");
+  const workspace = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "local",
+    "--path",
+    source,
+  );
+  const exported = await createArchive(sourceHome, workspace.workspaceId);
+  try {
+    const before = (await fs.readdir(tmpdir()))
+      .filter((name) => name.startsWith("paseo-transfer-receive-"))
+      .sort();
+    const corrupt = path.join(root, "malformed-archive.bin");
+    const bytes = await fs.readFile(exported.file);
+    await fs.writeFile(corrupt, bytes.subarray(0, bytes.length - 9));
+    const target = path.join(root, "malformed-copy");
+    await assert.rejects(
+      receiveArchive(targetHome, target, corrupt),
+      /Truncated/,
+    );
+    await assert.rejects(fs.access(target));
+    assert.deepEqual(
+      (await fs.readdir(tmpdir()))
+        .filter((name) => name.startsWith("paseo-transfer-receive-"))
+        .sort(),
+      before,
+    );
+    assert.equal(
+      await fs.readFile(path.join(source, "file"), "utf8"),
+      "original",
+    );
+    await assert.rejects(
+      createArchive(sourceHome, workspace.workspaceId, {
+        ...defaultLimits,
+        maxBytes: 1,
+      }),
+      /configured transfer limit/,
+    );
+  } finally {
+    await fs.rm(exported.dir, { recursive: true, force: true });
   }
 });
