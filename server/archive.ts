@@ -34,6 +34,7 @@ import {
   type BlobRef,
 } from "./archive-format";
 import { SourceFence } from "./source-fence";
+import { normalizeCliCwd } from "./cli-cwd";
 
 interface ArchiveFile {
   path: string;
@@ -115,7 +116,7 @@ export async function assertIdleCheckout(
   readAgents = async (): Promise<Array<{ status: string; cwd?: string }>> =>
     cli(home, "ls", "-g", "-a"),
 ) {
-  const canonical = await fs.realpath(cwd);
+  const canonical = await fs.realpath(normalizeCliCwd(cwd));
   const agents = await readAgents();
   for (const agent of agents) {
     if (!["running", "initializing"].includes(agent.status)) continue;
@@ -123,7 +124,11 @@ export async function assertIdleCheckout(
       throw new Error(
         "A running agent has no verified checkout; transfer held.",
       );
-    const agentPath = await fs.realpath(agent.cwd);
+    const agentPath = await fs.realpath(normalizeCliCwd(agent.cwd));
+    if (!(await fs.stat(agentPath)).isDirectory())
+      throw new Error(
+        "A running agent has no verified directory; transfer held.",
+      );
     if (inside(canonical, agentPath) || inside(agentPath, canonical))
       throw new Error(
         "Stop every running agent sharing this checkout before transferring it.",
@@ -986,7 +991,10 @@ export async function receiveArchive(
       if (session.title)
         await cli(home, "agent", "update", id, "--name", session.title);
       const inspected = await cli(home, "inspect", id);
-      if (inspected.Cwd !== target || inspected.Provider !== session.provider)
+      if (
+        normalizeCliCwd(inspected.Cwd) !== target ||
+        inspected.Provider !== session.provider
+      )
         throw new Error("Imported agent verification failed.");
       if (session.archived) await cli(home, "archive", id);
       agents.push(id);

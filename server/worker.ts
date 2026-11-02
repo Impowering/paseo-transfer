@@ -6,6 +6,7 @@ import { promises as fs } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { resolvePaseoCli } from "./paseo-cli";
+import { normalizeCliCwd } from "./cli-cwd";
 import { defaultLimits, limitsSchema, enforceLimit } from "../shared/limits";
 import type {
   FileEntry,
@@ -268,7 +269,11 @@ async function version() {
 }
 export async function list(home?: string): Promise<Workspace[]> {
   await version();
-  return cli(home, "workspace", "ls");
+  const workspaces: Workspace[] = await cli(home, "workspace", "ls");
+  return workspaces.map((workspace) => ({
+    ...workspace,
+    cwd: normalizeCliCwd(workspace.cwd),
+  }));
 }
 export async function snapshot(
   home: string | undefined,
@@ -690,7 +695,10 @@ export async function receive(
       if (session.title)
         await cli(home, "agent", "update", id, "--name", session.title);
       const inspected = await cli(home, "inspect", id);
-      if (inspected.Cwd !== target || inspected.Provider !== session.provider)
+      if (
+        normalizeCliCwd(inspected.Cwd) !== target ||
+        inspected.Provider !== session.provider
+      )
         throw new Error("Imported agent verification failed.");
       if (session.archived) await cli(home, "archive", id);
       agents.push(id);
