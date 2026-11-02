@@ -1,6 +1,7 @@
 import type { RpcInput } from "@getpaseo/plugin";
 import {
   exportSchema,
+  hostIdentity,
   taskStart,
   taskStatus,
   uploadStart,
@@ -34,14 +35,18 @@ const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 export function createTransferClient(
   getRpc: (id: string) => HostRpc = rpcForHost,
   pause = delay,
+  now = Date.now,
 ) {
   const runs = new Map<string, ConnectedRun>();
   let sequence = 0;
   async function task(serverId: string, value: Task) {
+    const identity = await getRpc(serverId)(hostIdentity, {});
+    if (identity.serverId !== serverId)
+      throw new Error("The Paseo host changed. Preview again.");
     const { id } = await getRpc(serverId)(taskStart, { serverId, task: value });
     try {
-      const deadline = Date.now() + 15 * 60_000;
-      while (Date.now() < deadline) {
+      const deadline = now() + identity.taskTimeoutSeconds * 1000;
+      while (now() < deadline) {
         const status = await getRpc(serverId)(taskStatus, { serverId, id });
         if (status.state === "failed") throw new Error(status.message);
         if (status.state === "done") return { id, ...status };
@@ -102,7 +107,7 @@ export function createTransferClient(
             targetId: input.targetId,
             exportId: exported.id,
             manifest,
-            expires: Date.now() + 10 * 60_000,
+            expires: now() + 10 * 60_000,
           },
         };
       } catch (error) {
@@ -114,7 +119,7 @@ export function createTransferClient(
       return release(plan.connected.sourceId, plan.connected.exportId);
     },
     start(plan: ConnectedPlan) {
-      if (plan.connected.expires < Date.now())
+      if (plan.connected.expires < now())
         throw new Error("Preview expired. Preview this transfer again.");
       if ([...runs.values()].some((run) => run.state === "running"))
         throw new Error(
@@ -122,7 +127,7 @@ export function createTransferClient(
         );
       for (const [id, run] of runs)
         if (runs.size >= 8 && run.state !== "running") runs.delete(id);
-      const id = `connected-${Date.now()}-${++sequence}`;
+      const id = `connected-${now()}-${++sequence}`;
       const run: ConnectedRun = {
         state: "running",
         message: "Checking source…",

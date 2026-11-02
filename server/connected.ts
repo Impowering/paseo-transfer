@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -6,7 +6,6 @@ import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   CHUNK_BYTES,
-  MAX_WIRE_BYTES,
   hostIdentity,
   taskStart,
   taskStatus,
@@ -15,8 +14,19 @@ import {
   uploadChunk,
   releaseData,
 } from "../shared/connected";
-import { dispatch } from "./worker";
-import type { Snapshot, TransferResult } from "../shared/types";
+import { check } from "./worker";
+import {
+  archiveSessions,
+  archiveSource,
+  createArchive,
+  receiveArchive,
+} from "./archive";
+import { hashFile } from "./archive-format";
+import {
+  defaultLimits,
+  enforceLimit,
+  type TransferLimits,
+} from "../shared/limits";
 
 type Status = RpcOutput<typeof taskStatus>;
 type Entry = {
@@ -34,17 +44,21 @@ const TTL = 30 * 60_000;
 /** Each host operates only on its own files, reached through Paseo's authenticated RPC. */
 export function createConnectedService(
   home = process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"),
+  getLimits: () => Promise<TransferLimits> = async () => defaultLimits,
 ) {
   const entries = new Map<string, Entry>();
   let disposed = false;
+  const ownServerId = async () =>
+    (await fs.readFile(path.join(home, "server-id"), "utf8")).trim();
   const identity = async () => ({
-    serverId: (await fs.readFile(path.join(home, "server-id"), "utf8")).trim(),
-    protocol: 1 as const,
+    serverId: await ownServerId(),
+    protocol: 2 as const,
+    taskTimeoutSeconds: (await getLimits()).taskTimeoutSeconds,
   });
   async function guard(serverId: string) {
     if (disposed)
       throw new Error("Transfer was reloaded. Reopen it and preview again.");
-    if (serverId !== (await identity()).serverId)
+    if (serverId !== (await ownServerId()))
       throw new Error(
         "The Paseo host changed. Reopen Transfer on the intended host.",
       );
@@ -86,9 +100,10 @@ export function createConnectedService(
     entries.set(id, entry);
     return { id, entry };
   }
-  const file = (entry: Entry) => path.join(entry.dir!, "snapshot.json");
+  const file = (entry: Entry) => path.join(entry.dir!, "archive.bin");
   async function start(input: RpcInput<typeof taskStart>) {
     await guard(input.serverId);
+    const limits = await getLimits();
     // Acquire an upload synchronously before another receive/release can consume it.
     const task = input.task;
     const upload = task.action === "receive" ? get(task.uploadId) : undefined;
@@ -119,15 +134,13 @@ export function createConnectedService(
       try {
         switch (task.action) {
           case "export": {
-            const snap = (await dispatch({
-              action: "snapshot",
+            const exported = await createArchive(
               home,
-              workspaceId: task.workspaceId,
-            })) as Snapshot;
-            if (snap.skipped.length)
-              throw new Error(
-                `Transfer cannot include every conversation: ${snap.skipped.join("; ")}`,
-              );
+              task.workspaceId,
+              limits,
+            );
+            entry.dir = exported.dir;
+            const snap = exported.manifest;
             if (
               task.mode === "move" &&
               snap.workspace.isolation === "worktree" &&
@@ -136,59 +149,51 @@ export function createConnectedService(
               throw new Error(
                 "This worktree has Git-ignored files. Choose Copy to keep those files on the source.",
               );
-            const data = Buffer.from(JSON.stringify(snap));
-            if (data.length > MAX_WIRE_BYTES)
-              throw new Error("Workspace exceeds the transfer size limit.");
-            entry.dir = await fs.mkdtemp(
-              path.join(tmpdir(), "paseo-transfer-"),
-            );
-            await fs.chmod(entry.dir, 0o700);
-            await fs.writeFile(file(entry), data, { mode: 0o600 });
             entry.status.manifest = {
               workspace: snap.workspace,
-              fingerprint: snap.fingerprint,
+              fingerprint: exported.fingerprint,
               sourceId: snap.sourceId,
               files: snap.files.length,
-              bytes: snap.bytes,
+              bytes: exported.bytes,
               branch: snap.branch,
               hasIgnored: snap.hasIgnored,
-              sessions: snap.sessions.map((s) => ({
-                ...s,
-                files: s.files.map((f) => ({ ...f, data: "" })),
-              })),
-              wireBytes: data.length,
-              chunks: Math.ceil(data.length / CHUNK_BYTES),
-              checksum: createHash("sha256").update(data).digest("hex"),
+              sessions: archiveSessions(snap.sessions),
+              wireBytes: exported.wireBytes,
+              chunks: Math.ceil(exported.wireBytes / CHUNK_BYTES),
+              checksum: exported.checksum,
             };
             break;
           }
           case "check": {
-            const checked = (await dispatch({ ...task, home })) as {
-              destination: string;
-            };
+            const checked = await check(
+              home,
+              task.destination,
+              task.sessions,
+              limits.maxFiles,
+            );
             entry.status.destination = checked.destination;
             break;
           }
           case "receive": {
-            const data = await fs.readFile(file(upload!));
-            if (
-              createHash("sha256").update(data).digest("hex") !==
-              upload!.checksum
-            )
+            if ((await hashFile(file(upload!))) !== upload!.checksum)
               throw new Error(
                 "Transfer upload checksum mismatch. Preview again.",
               );
-            const snap = JSON.parse(data.toString("utf8")) as Snapshot;
-            entry.status.result = (await dispatch({
-              action: "receive",
+            entry.status.result = await receiveArchive(
               home,
-              destination: task.destination,
-              snapshot: snap,
-            })) as TransferResult;
+              task.destination,
+              file(upload!),
+              limits,
+            );
             break;
           }
           case "archive":
-            await dispatch({ ...task, home });
+            await archiveSource(
+              home,
+              task.workspaceId,
+              task.fingerprint,
+              limits,
+            );
             break;
         }
         entry.status.state = "done";
@@ -245,6 +250,13 @@ export function createConnectedService(
     },
     async upload(input: RpcInput<typeof uploadStart>) {
       await guard(input.serverId);
+      const limits = await getLimits();
+      enforceLimit(input.wireBytes, limits.maxBytes, "Archive bytes");
+      const disk = await fs.statfs(tmpdir());
+      if (disk.bavail * disk.bsize < input.wireBytes * 3)
+        throw new Error(
+          "Not enough temporary disk space for archive, verification and destination.",
+        );
       const { id, entry } = allocate(true);
       try {
         entry.dir = await fs.mkdtemp(path.join(tmpdir(), "paseo-transfer-"));
@@ -292,8 +304,11 @@ export function createConnectedService(
   };
 }
 
-export function contributeConnected(server: PluginServerContext) {
-  const service = createConnectedService();
+export function contributeConnected(
+  server: PluginServerContext,
+  getLimits: () => Promise<TransferLimits>,
+) {
+  const service = createConnectedService(undefined, getLimits);
   server.handle(hostIdentity, service.identity);
   server.handle(taskStart, service.start);
   server.handle(taskStatus, service.status);

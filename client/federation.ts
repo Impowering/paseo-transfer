@@ -42,7 +42,7 @@ export function createFederation() {
   };
 }
 
-const registryKey = Symbol.for("tomgrin10.paseo-transfer.federation.v1");
+const registryKey = Symbol.for("Impowering.paseo-transfer.federation.v2");
 const realm = globalThis as typeof globalThis & {
   [registryKey]?: ReturnType<typeof createFederation>;
 };

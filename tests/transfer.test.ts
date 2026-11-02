@@ -1,6 +1,6 @@
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -29,7 +29,16 @@ import {
 import { invoke, sshArgs, shellQuote } from "../server/transport";
 import { sshHosts, tailscaleHosts } from "../server/discovery";
 import { sshFixture } from "../scripts/ssh-fixture";
-import { preview, start, status } from "../server/handlers";
+import { preview, start, status, configureLimits } from "../server/handlers";
+import { createArchive, receiveArchive } from "../server/archive";
+import { waitForSshPreview } from "../client/ssh-preview";
+import {
+  previewStartRpc,
+  previewStatusRpc,
+  runRpc,
+  statusRpc,
+} from "../shared/rpc";
+import { defaultLimits } from "../shared/limits";
 const exec = promisify(execFile);
 let root: string, sourceHome: string, targetHome: string, repo: string;
 const daemons: ReturnType<typeof spawn>[] = [];
@@ -48,8 +57,8 @@ const connected = createTransferClient(
   getRpc,
   () => new Promise((resolve) => setTimeout(resolve, 20)),
 );
-async function waitConnected(runId: string) {
-  const deadline = Date.now() + 120_000;
+async function waitConnected(runId: string, timeout = 120_000) {
+  const deadline = Date.now() + timeout;
   while (connected.status(runId).state === "running" && Date.now() < deadline)
     await new Promise((resolve) => setTimeout(resolve, 20));
   return connected.status(runId);
@@ -625,4 +634,755 @@ test("encrypted SSH transports push and pull between separate daemon homes", asy
   } finally {
     await fixture.close();
   }
+});
+
+test("connected archive transfers over 20,000 files and 256 MiB wire with full Git and index verification", async () => {
+  const source = path.join(root, "large-monorepo");
+  await fs.mkdir(source);
+  await git(source, "init", "-b", "main");
+  await git(source, "config", "user.email", "transfer@example.test");
+  await git(source, "config", "user.name", "Transfer Test");
+  const count = 20_005;
+  for (let start = 0; start < count; start += 64)
+    await Promise.all(
+      Array.from({ length: Math.min(64, count - start) }, (_, offset) =>
+        fs.writeFile(
+          path.join(source, `file-${start + offset}.txt`),
+          `content ${start + offset}\n`,
+        ),
+      ),
+    );
+  const large = await fs.open(path.join(source, "large.bin"), "wx");
+  try {
+    for (let index = 0; index < 129; index++) {
+      const data = randomBytes(1024 * 1024);
+      let offset = 0;
+      while (offset < data.length)
+        offset += (await large.write(data, offset)).bytesWritten;
+    }
+  } finally {
+    await large.close();
+  }
+  await git(source, "add", ".");
+  await git(source, "commit", "-qm", "large monorepo fixture");
+  await git(source, "branch", "unpublished");
+  await fs.writeFile(path.join(source, "file-0.txt"), "staged\n");
+  await git(source, "add", "file-0.txt");
+  await fs.writeFile(path.join(source, "file-0.txt"), "unstaged\n");
+  const workspace = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "local",
+    "--path",
+    source,
+  );
+  const target = path.join(root, "large-monorepo-copy");
+  const plan = await connected.preview({
+    sourceId: ids.get(sourceHome)!,
+    targetId: ids.get(targetHome)!,
+    workspaceId: workspace.workspaceId,
+    destination: target,
+    mode: "copy",
+  });
+  assert.ok(plan.files > 20_000);
+  assert.ok(plan.connected.manifest.wireBytes > 256 * 1024 * 1024);
+  const copied = await waitConnected(connected.start(plan).runId, 300_000);
+  assert.equal(copied.state, "done", copied.message);
+  assert.equal(copied.result?.verified, true);
+  assert.equal(copied.result?.sourceArchived, false);
+  assert.equal(
+    await git(target, "rev-parse", "HEAD"),
+    await git(source, "rev-parse", "HEAD"),
+  );
+  assert.equal(
+    await git(target, "rev-parse", "unpublished"),
+    await git(source, "rev-parse", "unpublished"),
+  );
+  assert.equal(
+    await git(target, "diff", "--cached", "--binary", "HEAD"),
+    await git(source, "diff", "--cached", "--binary", "HEAD"),
+  );
+  assert.equal(
+    await git(target, "status", "--porcelain"),
+    await git(source, "status", "--porcelain"),
+  );
+  assert.deepEqual(
+    await fs.readFile(path.join(target, "file-20004.txt")),
+    await fs.readFile(path.join(source, "file-20004.txt")),
+  );
+  assert.equal(
+    (await fs.stat(path.join(target, "large.bin"))).size,
+    129 * 1024 * 1024,
+  );
+});
+
+test("archive receive rejects malformed data without retaining a destination or private spool", async () => {
+  const source = path.join(root, "malformed-source");
+  await fs.mkdir(source);
+  await fs.writeFile(path.join(source, "file"), "original");
+  const workspace = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "local",
+    "--path",
+    source,
+  );
+  const exported = await createArchive(sourceHome, workspace.workspaceId);
+  try {
+    const before = (await fs.readdir(tmpdir()))
+      .filter((name) => name.startsWith("paseo-transfer-receive-"))
+      .sort();
+    const corrupt = path.join(root, "malformed-archive.bin");
+    const bytes = await fs.readFile(exported.file);
+    await fs.writeFile(corrupt, bytes.subarray(0, bytes.length - 9));
+    const target = path.join(root, "malformed-copy");
+    await assert.rejects(
+      receiveArchive(targetHome, target, corrupt),
+      /Truncated/,
+    );
+    await assert.rejects(fs.access(target));
+    assert.deepEqual(
+      (await fs.readdir(tmpdir()))
+        .filter((name) => name.startsWith("paseo-transfer-receive-"))
+        .sort(),
+      before,
+    );
+    assert.equal(
+      await fs.readFile(path.join(source, "file"), "utf8"),
+      "original",
+    );
+    await assert.rejects(
+      createArchive(sourceHome, workspace.workspaceId, {
+        ...defaultLimits,
+        maxBytes: 1,
+      }),
+      /configured transfer limit/,
+    );
+  } finally {
+    await fs.rm(exported.dir, { recursive: true, force: true });
+  }
+});
+
+test("standalone SSH workers return a large archive handle, verify receive and preserve a changed source", async () => {
+  const fixtureDir = path.join(root, "standalone-ssh");
+  await fs.mkdir(fixtureDir);
+  const fixture = await sshFixture(fixtureDir, { ...process.env });
+  const endpoint = {
+    target: "127.0.0.1",
+    port: fixture.port,
+    identityFile: fixture.key,
+    knownHostsFile: fixture.known,
+    home: sourceHome,
+  };
+  const source = path.join(root, "large-monorepo");
+  const workspace = (await cli(sourceHome, "workspace", "ls")).find(
+    (entry: any) => entry.cwd === source,
+  );
+  let exported: any;
+  try {
+    exported = await invoke<any>(endpoint, {
+      action: "archive-export",
+      workspaceId: workspace.workspaceId,
+    });
+    assert.ok(exported.wireBytes > 256 * 1024 * 1024);
+    assert.ok(
+      JSON.stringify(exported).length < 10_000,
+      "the worker response contains metadata, never the payload",
+    );
+    const upload = path.join(root, "standalone-upload.bin");
+    await fs.copyFile(exported.file, upload);
+    const target = path.join(root, "standalone-copy");
+    const targetEndpoint = { ...endpoint, home: targetHome };
+    await assert.rejects(
+      invoke(targetEndpoint, {
+        action: "archive-receive",
+        file: upload,
+        checksum: "0".repeat(64),
+        destination: target,
+      }),
+      /checksum mismatch/,
+    );
+    await assert.rejects(fs.access(target));
+    const result = await invoke<any>(targetEndpoint, {
+      action: "archive-receive",
+      file: upload,
+      checksum: exported.checksum,
+      destination: target,
+    });
+    assert.equal(result.verified, true);
+    assert.equal(result.sourceArchived, false);
+    assert.equal(
+      await git(target, "rev-parse", "HEAD"),
+      await git(source, "rev-parse", "HEAD"),
+    );
+    assert.equal(
+      await git(target, "status", "--porcelain"),
+      await git(source, "status", "--porcelain"),
+    );
+    await fs.appendFile(path.join(source, "file-0.txt"), "new source edit\n");
+    await assert.rejects(
+      invoke(endpoint, {
+        action: "archive-source",
+        workspaceId: workspace.workspaceId,
+        fingerprint: exported.fingerprint,
+      }),
+      /Source changed/,
+    );
+    assert.ok(
+      (await cli(sourceHome, "workspace", "ls")).some(
+        (entry: any) => entry.workspaceId === workspace.workspaceId,
+      ),
+    );
+    await assert.rejects(
+      invoke(endpoint, {
+        action: "archive-release",
+        file: path.join(root, "outside", "archive.bin"),
+      }),
+      /private export archive/,
+    );
+  } finally {
+    if (exported) {
+      await invoke(endpoint, {
+        action: "archive-release",
+        file: exported.file,
+      });
+      await assert.rejects(fs.access(exported.file));
+    }
+    await fixture.close();
+  }
+});
+
+test("late edits to an earlier source file are refused during final source archival", async () => {
+  const { archiveWriter } = await import("../server/archive-format");
+  const { archiveSource } = await import("../server/archive");
+  const source = path.join(root, "late-source-edit");
+  await fs.mkdir(source);
+  await fs.writeFile(path.join(source, "a.txt"), "old");
+  await fs.writeFile(path.join(source, "z.bin"), Buffer.alloc(1024 * 1024));
+  const workspace = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "local",
+    "--path",
+    source,
+  );
+  for (const phase of ["late-entry", "after-export"]) {
+    await fs.writeFile(path.join(source, "a.txt"), "old");
+    const baseline = await createArchive(sourceHome, workspace.workspaceId);
+    try {
+      await assert.rejects(
+        archiveSource(
+          sourceHome,
+          workspace.workspaceId,
+          baseline.fingerprint,
+          defaultLimits,
+          async (home, id, limits, options) => {
+            const current = await createArchive(home, id, limits, {
+              ...options,
+              writer: async (file, configured) => {
+                const writer = await archiveWriter(file, configured);
+                return {
+                  ...writer,
+                  add: async (name) => {
+                    if (
+                      phase === "late-entry" &&
+                      name === path.join(source, "z.bin")
+                    )
+                      await fs.writeFile(path.join(source, "a.txt"), "NEW");
+                    return writer.add(name);
+                  },
+                };
+              },
+            });
+            if (phase === "after-export")
+              await fs.writeFile(path.join(source, "a.txt"), "NEW");
+            return current;
+          },
+        ),
+        /Source changed/,
+      );
+      assert.equal(
+        await fs.readFile(path.join(source, "a.txt"), "utf8"),
+        "NEW",
+      );
+      assert.ok(
+        (await cli(sourceHome, "workspace", "ls")).some(
+          (entry: any) => entry.workspaceId === workspace.workspaceId,
+        ),
+      );
+    } finally {
+      await fs.rm(baseline.dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("ambiguous native creation preserves a registered or unverifiable destination", async () => {
+  const source = path.join(root, "ambiguous-native-source");
+  await fs.mkdir(source);
+  await fs.writeFile(path.join(source, "file"), "preserve me");
+  const workspace = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "local",
+    "--path",
+    source,
+  );
+  const exported = await createArchive(sourceHome, workspace.workspaceId);
+  try {
+    for (const mode of ["committed", "unavailable", "pending"]) {
+      const target = path.join(root, "ambiguous-native-" + mode);
+      let reconciled = false;
+      await assert.rejects(
+        receiveArchive(targetHome, target, exported.file, defaultLimits, {
+          cli: async (home, ...args) => {
+            if (mode === "committed") await cli(home!, ...args);
+            throw new Error("native creation acknowledgement lost");
+          },
+          list: async (home) => {
+            reconciled = true;
+            if (mode === "unavailable")
+              throw new Error("native inventory unavailable");
+            return (await import("../server/worker")).list(home);
+          },
+        }),
+        /Destination preserved.*Reconcile before retrying/,
+      );
+      assert.equal(reconciled, true);
+      assert.equal(
+        await fs.readFile(path.join(target, "file"), "utf8"),
+        "preserve me",
+      );
+      if (mode === "committed")
+        assert.ok(
+          (await cli(targetHome, "workspace", "ls")).some(
+            (entry: any) => entry.cwd === target,
+          ),
+        );
+    }
+  } finally {
+    await fs.rm(exported.dir, { recursive: true, force: true });
+  }
+});
+
+test("SSH preview/start handlers transfer over 20,000 files and 256 MiB in all endpoint directions", async () => {
+  const fixtureDir = path.join(root, "handler-ssh");
+  await fs.mkdir(fixtureDir);
+  const fixture = await sshFixture(fixtureDir, { ...process.env });
+  const remote = {
+    target: "127.0.0.1",
+    port: fixture.port,
+    identityFile: fixture.key,
+    knownHostsFile: fixture.known,
+  };
+  const source = path.join(root, "large-monorepo");
+  const workspace = (await cli(sourceHome, "workspace", "ls")).find(
+    (entry: any) => entry.cwd === source,
+  );
+  try {
+    configureLimits(async () => ({ ...defaultLimits, maxFiles: 100 }));
+    await assert.rejects(
+      preview({
+        source: { target: "", home: sourceHome },
+        target: { ...remote, home: targetHome },
+        workspaceId: workspace.workspaceId,
+        destination: path.join(root, "ssh-over-limit"),
+        mode: "copy",
+      }),
+      /limit/,
+    );
+    await assert.rejects(fs.access(path.join(root, "ssh-over-limit")));
+    configureLimits(async () => defaultLimits);
+    const rpc = getRpc(ids.get(sourceHome)!);
+    let index = 0;
+    for (const [from, to] of [
+      [
+        { target: "", home: sourceHome },
+        { ...remote, home: targetHome },
+      ],
+      [
+        { ...remote, home: sourceHome },
+        { target: "", home: targetHome },
+      ],
+      [
+        { ...remote, home: sourceHome },
+        { ...remote, home: targetHome },
+      ],
+    ]) {
+      const target = path.join(root, `ssh-large-handler-${++index}`);
+      const plan = await waitForSshPreview(
+        {
+          source: from,
+          target: to,
+          workspaceId: workspace.workspaceId,
+          destination: target,
+          mode: "copy",
+        },
+        (input) => rpc(previewStartRpc, input),
+        (input) => rpc(previewStatusRpc, input),
+        () => new Promise((resolve) => setTimeout(resolve, 20)),
+      );
+      assert.ok(plan.files > 20_000);
+      assert.ok(plan.bytes > 256 * 1024 * 1024);
+      assert.ok(JSON.stringify(plan).length < 10_000);
+      const { runId } = await rpc(runRpc, { planId: plan.id });
+      const deadline = Date.now() + 300_000;
+      let result = await rpc(statusRpc, { runId });
+      while (result.state === "running" && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        result = await rpc(statusRpc, { runId });
+      }
+      assert.equal(result.state, "done", result.message);
+      assert.equal(result.result?.verified, true);
+      assert.equal(result.result?.sourceArchived, false);
+      assert.equal(
+        await git(target, "rev-parse", "HEAD"),
+        await git(source, "rev-parse", "HEAD"),
+      );
+      assert.equal(
+        await git(target, "rev-parse", "unpublished"),
+        await git(source, "rev-parse", "unpublished"),
+      );
+      assert.equal(
+        await git(
+          target,
+          "diff",
+          "--cached",
+          "--binary",
+          "--full-index",
+          "HEAD",
+        ),
+        await git(
+          source,
+          "diff",
+          "--cached",
+          "--binary",
+          "--full-index",
+          "HEAD",
+        ),
+      );
+      assert.equal(
+        await git(target, "status", "--porcelain"),
+        await git(source, "status", "--porcelain"),
+      );
+      assert.deepEqual(
+        await fs.readFile(path.join(target, "file-20004.txt")),
+        await fs.readFile(path.join(source, "file-20004.txt")),
+      );
+      assert.equal(
+        (await fs.stat(path.join(target, "large.bin"))).size,
+        129 * 1024 * 1024,
+      );
+      assert.ok(
+        (await cli(sourceHome, "workspace", "ls")).some(
+          (entry: any) => entry.workspaceId === workspace.workspaceId,
+        ),
+      );
+    }
+  } finally {
+    configureLimits(async () => defaultLimits);
+    await fixture.close();
+  }
+});
+
+test("SSH preview and run use short polled RPCs through the actual authenticated daemon client", async () => {
+  const source = path.join(root, "ssh-polled-preview-source");
+  await fs.mkdir(source);
+  await fs.writeFile(path.join(source, "note"), "polled preview");
+  const workspace = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "local",
+    "--path",
+    source,
+  );
+  const rpc = getRpc(ids.get(sourceHome)!);
+  const destination = path.join(root, "ssh-polled-preview-target");
+  const plan = await waitForSshPreview(
+    {
+      source: { target: "", home: sourceHome },
+      target: { target: "", home: targetHome },
+      workspaceId: workspace.workspaceId,
+      destination,
+      mode: "copy",
+    },
+    (input) => rpc(previewStartRpc, input),
+    (input) => rpc(previewStatusRpc, input),
+    () => new Promise((resolve) => setTimeout(resolve, 20)),
+  );
+  assert.equal(plan.workspace.workspaceId, workspace.workspaceId);
+  const { runId } = await rpc(runRpc, { planId: plan.id });
+  let result = await rpc(statusRpc, { runId });
+  for (
+    let attempts = 0;
+    result.state === "running" && attempts < 1000;
+    attempts++
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    result = await rpc(statusRpc, { runId });
+  }
+  assert.equal(result.state, "done", result.message);
+  assert.equal(result.result?.verified, true);
+  assert.equal(result.result?.sourceArchived, false);
+  assert.equal(
+    await fs.readFile(path.join(destination, "note"), "utf8"),
+    "polled preview",
+  );
+});
+
+test("native managed workspace archive preserves the common repository and sibling worktree", async () => {
+  const base = path.join(root, "archive-shared-base"),
+    sibling = path.join(root, "archive-shared-sibling");
+  await fs.mkdir(base);
+  await git(base, "init", "-b", "main");
+  await git(base, "config", "user.email", "transfer@example.test");
+  await git(base, "config", "user.name", "Transfer Test");
+  await fs.writeFile(path.join(base, "tracked.txt"), "source\n");
+  await git(base, "add", ".");
+  await git(base, "commit", "-qm", "shared base");
+  const managed = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "worktree",
+    "--path",
+    base,
+    "--new-branch",
+    "archive-own-branch",
+    "--worktree-slug",
+    "shared-archive-proof",
+  );
+  await git(
+    base,
+    "worktree",
+    "add",
+    "-b",
+    "archive-sibling-branch",
+    sibling,
+    "HEAD",
+  );
+  await fs.writeFile(path.join(sibling, "sibling.txt"), "sibling changes\n");
+  await git(sibling, "add", ".");
+  await git(sibling, "commit", "-qm", "sibling must survive");
+  const main = await git(base, "rev-parse", "HEAD"),
+    siblingHead = await git(sibling, "rev-parse", "HEAD"),
+    status = await git(sibling, "status", "--porcelain");
+  await cli(sourceHome, "workspace", "archive", managed.workspaceId);
+  for (
+    let attempt = 0;
+    attempt < 100 &&
+    (await fs.stat(managed.cwd).then(
+      () => true,
+      () => false,
+    ));
+    attempt++
+  )
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  await assert.rejects(fs.access(managed.cwd));
+  assert.ok((await fs.stat(path.join(base, ".git"))).isDirectory());
+  assert.equal(await git(base, "rev-parse", "HEAD"), main);
+  assert.equal(await git(base, "rev-parse", "refs/heads/main"), main);
+  assert.equal(await git(sibling, "rev-parse", "HEAD"), siblingHead);
+  assert.equal(
+    await git(base, "rev-parse", "refs/heads/archive-sibling-branch"),
+    siblingHead,
+  );
+  assert.equal(await git(sibling, "status", "--porcelain"), status);
+  assert.equal(
+    await fs.readFile(path.join(sibling, "sibling.txt"), "utf8"),
+    "sibling changes\n",
+  );
+});
+
+test("sibling worktree commits do not invalidate the source checkout handoff", async () => {
+  const { archiveWriter } = await import("../server/archive-format");
+  const base = path.join(root, "copy-shared-base"),
+    sibling = path.join(root, "copy-shared-sibling");
+  await fs.mkdir(base);
+  await git(base, "init", "-b", "main");
+  await git(base, "config", "user.email", "transfer@example.test");
+  await git(base, "config", "user.name", "Transfer Test");
+  await fs.writeFile(path.join(base, "tracked.txt"), "source\n");
+  await git(base, "add", ".");
+  await git(base, "commit", "-qm", "shared base");
+  const managed = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "worktree",
+    "--path",
+    base,
+    "--new-branch",
+    "copy-own-branch",
+    "--worktree-slug",
+    "shared-copy-proof",
+  );
+  await git(
+    base,
+    "worktree",
+    "add",
+    "-b",
+    "copy-sibling-branch",
+    sibling,
+    "HEAD",
+  );
+  const initialSibling = (await git(sibling, "rev-parse", "HEAD")).trim();
+  let changed = false;
+  const exported = await createArchive(
+    sourceHome,
+    managed.workspaceId,
+    defaultLimits,
+    {
+      writer: async (...args) => {
+        const writer = await archiveWriter(...args);
+        return {
+          ...writer,
+          async add(file) {
+            const ref = await writer.add(file);
+            if (!changed && path.basename(file) === "tracked.txt") {
+              changed = true;
+              await fs.writeFile(
+                path.join(sibling, "sibling.txt"),
+                "new sibling commit\n",
+              );
+              await git(sibling, "add", ".");
+              await git(sibling, "commit", "-qm", "concurrent sibling commit");
+              await git(base, "pack-refs", "--all");
+            }
+            return ref;
+          },
+        };
+      },
+    },
+  );
+  try {
+    assert.equal(changed, true);
+    const fresh = await createArchive(sourceHome, managed.workspaceId);
+    try {
+      assert.equal(fresh.fingerprint, exported.fingerprint);
+    } finally {
+      await fs.rm(fresh.dir, { recursive: true, force: true });
+    }
+    const destination = path.join(root, "shared-copy-target");
+    const result = await receiveArchive(targetHome, destination, exported.file);
+    assert.equal(result.verified, true);
+    assert.equal(
+      (await git(destination, "rev-parse", "copy-sibling-branch")).trim(),
+      initialSibling,
+      "the consistent extra-ref snapshot is retained, not replaced with later sibling commits",
+    );
+    assert.equal(
+      await git(destination, "rev-parse", "HEAD"),
+      await git(managed.cwd, "rev-parse", "HEAD"),
+    );
+    const { archiveSource } = await import("../server/archive");
+    await archiveSource(sourceHome, managed.workspaceId, exported.fingerprint);
+    await assert.rejects(fs.access(managed.cwd));
+    assert.equal(
+      await fs.readFile(path.join(sibling, "sibling.txt"), "utf8"),
+      "new sibling commit\n",
+    );
+    assert.notEqual(
+      (await git(sibling, "rev-parse", "HEAD")).trim(),
+      initialSibling,
+    );
+  } finally {
+    await fs.rm(exported.dir, { recursive: true, force: true });
+  }
+});
+
+test("source branch updates are rejected even when sibling refs are allowed to advance", async () => {
+  const { archiveWriter } = await import("../server/archive-format");
+  const base = path.join(root, "own-ref-base"),
+    sibling = path.join(root, "own-ref-sibling");
+  await fs.mkdir(base);
+  await git(base, "init", "-b", "main");
+  await git(base, "config", "user.email", "transfer@example.test");
+  await git(base, "config", "user.name", "Transfer Test");
+  await fs.writeFile(path.join(base, "tracked.txt"), "source\n");
+  await git(base, "add", ".");
+  await git(base, "commit", "-qm", "own base");
+  const managed = await cli(
+    sourceHome,
+    "workspace",
+    "create",
+    "--isolation",
+    "worktree",
+    "--path",
+    base,
+    "--new-branch",
+    "must-hold-own-ref",
+    "--worktree-slug",
+    "own-ref-proof",
+  );
+  await git(
+    base,
+    "worktree",
+    "add",
+    "-b",
+    "independent-commit",
+    sibling,
+    "HEAD",
+  );
+  await fs.writeFile(path.join(sibling, "other.txt"), "other commit\n");
+  await git(sibling, "add", ".");
+  await git(sibling, "commit", "-qm", "a different commit");
+  const different = (await git(sibling, "rev-parse", "HEAD")).trim();
+  const original = (await git(managed.cwd, "rev-parse", "HEAD")).trim();
+  for (const restore of [false, true]) {
+    await git(base, "update-ref", "refs/heads/must-hold-own-ref", original);
+    let changed = false;
+    await assert.rejects(
+      createArchive(sourceHome, managed.workspaceId, defaultLimits, {
+        writer: async (...args) => {
+          const writer = await archiveWriter(...args);
+          return {
+            ...writer,
+            async add(file) {
+              const result = await writer.add(file);
+              if (!changed && path.basename(file) === "tracked.txt") {
+                changed = true;
+                await git(
+                  base,
+                  "update-ref",
+                  "refs/heads/must-hold-own-ref",
+                  different,
+                );
+                if (restore)
+                  await git(
+                    base,
+                    "update-ref",
+                    "refs/heads/must-hold-own-ref",
+                    original,
+                  );
+              }
+              return result;
+            },
+          };
+        },
+      }),
+      /Source (Git state|changed)/,
+    );
+    assert.equal(changed, true);
+  }
+  assert.equal(
+    await fs.readFile(path.join(managed.cwd, "tracked.txt"), "utf8"),
+    "source\n",
+  );
+  assert.ok(
+    (await cli(sourceHome, "workspace", "ls")).some(
+      (entry: any) => entry.workspaceId === managed.workspaceId,
+    ),
+  );
 });

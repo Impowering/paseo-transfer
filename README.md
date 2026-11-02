@@ -1,11 +1,19 @@
 # paseo-transfer
 
-[![npm version](https://img.shields.io/npm/v/paseo-transfer?style=for-the-badge&color=cb3837)](https://www.npmjs.com/package/paseo-transfer)
-[![npm downloads](https://img.shields.io/npm/dm/paseo-transfer?style=for-the-badge&color=cb3837)](https://www.npmjs.com/package/paseo-transfer)
+[![Upstream npm version](https://img.shields.io/npm/v/paseo-transfer?style=for-the-badge&color=cb3837)](https://www.npmjs.com/package/paseo-transfer)
+[![Upstream npm downloads](https://img.shields.io/npm/dm/paseo-transfer?style=for-the-badge&color=cb3837)](https://www.npmjs.com/package/paseo-transfer)
 [![Paseo](https://img.shields.io/badge/Paseo-%E2%89%A5%200.14.0-8A63D2?style=for-the-badge)](https://paseo.sh)
-[![License](https://img.shields.io/github/license/tomgrin10/paseo-transfer?style=for-the-badge&color=2563eb)](LICENSE)
+[![License](https://img.shields.io/github/license/Impowering/paseo-transfer?style=for-the-badge&color=2563eb)](LICENSE)
 
 Copy or move a workspace to another host, with Git history, local changes, and Claude/Codex conversations.
+
+This Impower fork adds disk-spooled connected and SSH transfers for large repositories. It defaults to 100,000 files and 16 GiB per archive, with configurable host limits and incremental verification. Install the same reviewed commit on both hosts:
+
+```sh
+paseo plugin install git:Impowering/paseo-transfer --ref <immutable-commit>
+```
+
+The runtime plugin ID remains `transfer`. Connected protocol 2 requires this fork on both ends; it does not silently interoperate with upstream protocol 1. Paseo 0.14.0+ is still required. Original author: [Tom Gringauz](https://github.com/tomgrin10/paseo-transfer); MIT attribution is preserved.
 
 ![Transfer popup with the current workspace selected and a verified copy preview](docs/screenshots/transfer.png)
 
@@ -16,8 +24,10 @@ Example using fixture workspace and host data.
 Enable plugins in **Settings → Plugins**, then run on both hosts:
 
 ```sh
-paseo plugin install paseo-transfer
+paseo plugin install git:Impowering/paseo-transfer --ref <immutable-commit>
 ```
+
+Use the same reviewed full commit SHA on every host. The upstream command `paseo plugin install paseo-transfer` installs Tom’s original npm release.
 
 Both hosts need Paseo **0.14.0+**, Node **22+**, Git, and Linux/macOS or WSL. Connect both hosts in Paseo and keep their daemons running. The receiving host needs its own provider CLIs and credentials.
 
@@ -40,11 +50,14 @@ See the [transfer details](docs/behavior.md) for supported content, limits, and 
 ## Development
 
 ```sh
-npm ci
-npm run verify
+pnpm install
+pnpm run prepare
+pnpm run typecheck
+pnpm run format:check
+pnpm test
 ```
 
-Reload with `paseo plugin reload transfer`. Provider checks: `npm run test:live`. UI preview: `npx tsx scripts/ui-preview.tsx`.
+Reload with `paseo plugin reload transfer`. Provider checks: `pnpm run test:live` (requires separate provider credentials). UI preview: `pnpm exec tsx scripts/ui-preview.tsx`.
 
 ## License
 

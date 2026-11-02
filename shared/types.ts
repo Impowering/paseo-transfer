@@ -1,3 +1,5 @@
+import type { TransferLimits } from "./limits";
+
 export interface Host {
   target: string;
   label: string;
@@ -47,6 +49,19 @@ export interface Snapshot {
   fingerprint: string;
   bytes: number;
 }
+export interface ExportedArchive {
+  file: string;
+  fingerprint: string;
+  checksum: string;
+  wireBytes: number;
+  bytes: number;
+  workspace: Workspace;
+  sourceId: string;
+  files: number;
+  branch: string | null;
+  sessions: Session[];
+  hasIgnored: boolean;
+}
 export interface Plan {
   id: string;
   workspace: Workspace;
@@ -66,10 +81,43 @@ export interface TransferResult {
   sourceArchived: boolean;
 }
 export type WorkerRequest =
+  | {
+      action: "archive-export";
+      home?: string;
+      workspaceId: string;
+      limits?: Partial<TransferLimits>;
+    }
+  | {
+      action: "archive-receive";
+      home?: string;
+      destination: string;
+      file: string;
+      checksum: string;
+      limits?: Partial<TransferLimits>;
+    }
+  | {
+      action: "archive-source";
+      home?: string;
+      workspaceId: string;
+      fingerprint: string;
+      limits?: Partial<TransferLimits>;
+    }
+  | {
+      action: "archive-upload";
+      wireBytes: number;
+      limits?: Partial<TransferLimits>;
+    }
+  | { action: "archive-release"; file: string }
   | { action: "info"; home?: string }
   | { action: "list"; home?: string }
   | { action: "snapshot"; home?: string; workspaceId: string }
-  | { action: "check"; home?: string; destination: string; sessions: Session[] }
+  | {
+      action: "check";
+      home?: string;
+      destination: string;
+      sessions: Session[];
+      limits?: Partial<TransferLimits>;
+    }
   | {
       action: "receive";
       home?: string;

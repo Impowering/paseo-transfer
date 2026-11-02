@@ -2,7 +2,8 @@ import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
 export const CHUNK_BYTES = 192 * 1024;
-export const MAX_WIRE_BYTES = 256 * 1024 * 1024;
+// Workload limits are host settings; this is only JavaScript's exact integer boundary.
+export const MAX_WIRE_BYTES = Number.MAX_SAFE_INTEGER;
 export const workspaceSchema = z.object({
   workspaceId: z.string(),
   name: z.string(),
@@ -50,7 +51,11 @@ const id = z.string().uuid();
 export const hostIdentity = defineRpc({
   name: "transfer.identity",
   input: z.object({}),
-  output: z.object({ serverId, protocol: z.literal(1) }),
+  output: z.object({
+    serverId,
+    protocol: z.literal(2),
+    taskTimeoutSeconds: z.number().int().min(1).max(86400).default(3600),
+  }),
 });
 export const taskStart = defineRpc({
   name: "transfer.task.start",

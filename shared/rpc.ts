@@ -84,3 +84,22 @@ export const statusRpc = defineRpc({
       .nullable(),
   }),
 });
+
+// Large SSH exports run outside the daemon client's per-request deadline.
+export const previewStartRpc = defineRpc({
+  name: "transfer.preview.start",
+  input: previewRpc.input,
+  output: z.object({
+    previewId: z.string(),
+    timeoutSeconds: z.number().int().positive(),
+  }),
+});
+export const previewStatusRpc = defineRpc({
+  name: "transfer.preview.status",
+  input: z.object({ previewId: z.string() }),
+  output: z.object({
+    state: z.enum(["running", "done", "failed"]),
+    message: z.string(),
+    plan: previewRpc.output.nullable(),
+  }),
+});
